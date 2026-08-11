@@ -1,0 +1,96 @@
+services:
+
+  mosquitto:
+    image: eclipse-mosquitto
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: motor_db
+      TZ: "Asia/Kuala_Lumpur"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data 
+
+  influxdb:
+    image: influxdb:3-core
+    container_name: influxdb
+    user: "root"
+    entrypoint: ["influxdb3", "serve", "--node-id=node0", "--object-store=file", "--data-dir=/var/lib/influxdb3/data"]
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./influxdb_data:/var/lib/influxdb3/data
+
+  node-red:
+    image: nodered/node-red:latest
+    container_name: node-red
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./node_red_data:/data 
+    depends_on:
+      - mosquitto
+      - postgres
+      - influxdb
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s 
+      GF_PANELS_DISABLE_SANITIZE_HTML: true
+      GF_PANELS_ALLOW_EMBED: true
+    volumes:
+      - ./grafana_data:/var/lib/grafana
+    depends_on:
+      - postgres
+      - influxdb
+
+  langflow:
+    image: langflowai/langflow:latest
+    container_name: langflow
+    ports:
+      - "7860:7860"
+    environment:
+      - LANGFLOW_BACKEND_CORS_ORIGINS=["http://localhost:3000"]
+    volumes:
+      - ./langflow_data:/var/lib/langflow
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_data:/root/.ollama
+
+  api:
+    build: ./pdm-backend
+    container_name: api
+    ports:
+      - "8000:8000"
+    environment:
+      INFLUXDB3_AUTH_TOKEN: ${INFLUXDB3_AUTH_TOKEN}
+    depends_on:
+      - influxdb
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./pdm-backend:/app

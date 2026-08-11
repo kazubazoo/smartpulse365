@@ -1,0 +1,10 @@
+﻿node_modules/
+dist/
+.env
+grafana_data/
+influxdb_data/
+langflow_data/
+node_red_data/
+ollama_data/
+postgres_data/
+mosquitto/
