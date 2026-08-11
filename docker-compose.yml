@@ -62,26 +62,6 @@ services:
       - postgres
       - influxdb
 
-  langflow:
-    image: langflowai/langflow:latest
-    container_name: langflow
-    ports:
-      - "7860:7860"
-    environment:
-      - LANGFLOW_BACKEND_CORS_ORIGINS=["http://localhost:3000"]
-    volumes:
-      - ./langflow_data:/var/lib/langflow
-    depends_on:
-      - ollama
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./ollama_data:/root/.ollama
-
   api:
     build: ./pdm-backend
     container_name: api
