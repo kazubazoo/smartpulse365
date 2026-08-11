@@ -1,0 +1,347 @@
+[
+    {
+        "id": "9d97c2693a2cda3c",
+        "type": "tab",
+        "label": "PLC Modbus Production Pipeline",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "572efb4b395ecb96",
+        "type": "modbus-read",
+        "z": "9d97c2693a2cda3c",
+        "name": "D210: Motor Status",
+        "topic": "vbr_status_block",
+        "showStatusActivities": true,
+        "logIOActivities": false,
+        "showErrors": true,
+        "showWarnings": true,
+        "unitid": "1",
+        "dataType": "HoldingRegister",
+        "adr": "210",
+        "quantity": "1",
+        "rate": "1",
+        "rateUnit": "s",
+        "delayOnStart": false,
+        "enableDeformedMessages": false,
+        "startDelayTime": "",
+        "server": "0ff5a3f81a676a13",
+        "useIOFile": false,
+        "ioFile": "",
+        "useIOForPayload": false,
+        "emptyMsgOnFail": false,
+        "x": 210,
+        "y": 140,
+        "wires": [
+            [
+                "188acf9dcb72fb28"
+            ],
+            []
+        ]
+    },
+    {
+        "id": "0ab68af8a3b4a43c",
+        "type": "modbus-read",
+        "z": "9d97c2693a2cda3c",
+        "name": "D222-D230: Power & Temp",
+        "topic": "power_temp_block",
+        "showStatusActivities": true,
+        "logIOActivities": false,
+        "showErrors": true,
+        "showWarnings": true,
+        "unitid": "1",
+        "dataType": "HoldingRegister",
+        "adr": "222",
+        "quantity": "9",
+        "rate": "1",
+        "rateUnit": "s",
+        "delayOnStart": false,
+        "enableDeformedMessages": false,
+        "startDelayTime": "",
+        "server": "0ff5a3f81a676a13",
+        "useIOFile": false,
+        "ioFile": "",
+        "useIOForPayload": false,
+        "emptyMsgOnFail": false,
+        "x": 230,
+        "y": 220,
+        "wires": [
+            [
+                "188acf9dcb72fb28"
+            ],
+            []
+        ]
+    },
+    {
+        "id": "ba5a14c7a29c3bd6",
+        "type": "modbus-read",
+        "z": "9d97c2693a2cda3c",
+        "name": "D4110-D4212: Controls & Metrics",
+        "topic": "control_metrics_block",
+        "showStatusActivities": true,
+        "logIOActivities": false,
+        "showErrors": true,
+        "showWarnings": true,
+        "unitid": "1",
+        "dataType": "HoldingRegister",
+        "adr": "4110",
+        "quantity": "104",
+        "rate": "1",
+        "rateUnit": "s",
+        "delayOnStart": false,
+        "enableDeformedMessages": false,
+        "startDelayTime": "",
+        "server": "0ff5a3f81a676a13",
+        "useIOFile": false,
+        "ioFile": "",
+        "useIOForPayload": false,
+        "emptyMsgOnFail": false,
+        "x": 250,
+        "y": 300,
+        "wires": [
+            [
+                "188acf9dcb72fb28"
+            ],
+            []
+        ]
+    },
+    {
+        "id": "dc6ad1bf03b2751e",
+        "type": "modbus-read",
+        "z": "9d97c2693a2cda3c",
+        "name": "D400-D418: Extended Vibration",
+        "topic": "vib_extended_block",
+        "showStatusActivities": true,
+        "logIOActivities": false,
+        "showErrors": true,
+        "showWarnings": true,
+        "unitid": "1",
+        "dataType": "HoldingRegister",
+        "adr": "400",
+        "quantity": "19",
+        "rate": "1",
+        "rateUnit": "s",
+        "delayOnStart": false,
+        "enableDeformedMessages": false,
+        "startDelayTime": "",
+        "server": "0ff5a3f81a676a13",
+        "useIOFile": false,
+        "ioFile": "",
+        "useIOForPayload": false,
+        "emptyMsgOnFail": false,
+        "x": 250,
+        "y": 380,
+        "wires": [
+            [
+                "188acf9dcb72fb28"
+            ],
+            []
+        ]
+    },
+    {
+        "id": "188acf9dcb72fb28",
+        "type": "join",
+        "z": "9d97c2693a2cda3c",
+        "name": "Aggregate Modbus Registers",
+        "mode": "custom",
+        "build": "object",
+        "property": "payload",
+        "propertyType": "msg",
+        "key": "topic",
+        "joiner": "\\n",
+        "joinerType": "str",
+        "useparts": true,
+        "accumulate": true,
+        "timeout": "",
+        "count": "4",
+        "reduceRight": false,
+        "reduceExp": "",
+        "reduceInit": "",
+        "reduceInitType": "",
+        "reduceFixup": "",
+        "x": 590,
+        "y": 260,
+        "wires": [
+            [
+                "05f2fd2c60362d29"
+            ]
+        ]
+    },
+    {
+        "id": "05f2fd2c60362d29",
+        "type": "function",
+        "z": "9d97c2693a2cda3c",
+        "name": "Map, Scale & Process Buffer",
+        "func": "let blocks = msg.payload;\n\n// Guard clause to ensure all network blocks arrived safely\nif (!blocks.vbr_status_block || !blocks.power_temp_block ||\n    !blocks.control_metrics_block || !blocks.vib_extended_block) return null;\n\n// ---------------------------------------------------------------\n// HELPER: Modbus registers arrive as UNSIGNED 16-bit (0..65535).\n// Sensor values that can legitimately be negative (acceleration,\n// chip temperature below 0 degC) are 16-bit SIGNED and must be\n// re-interpreted, or -0.5g would read as +65535-ish garbage.\n// ---------------------------------------------------------------\nfunction toSigned16(v) {\n    return v > 32767 ? v - 65536 : v;\n}\n\nfunction safe(v) {\n    return (typeof v === \"number\" && isFinite(v)) ? v : 0;\n}\n\n// 1. D210 Motor Status (block now contains only this single register)\nlet statusCode = blocks.vbr_status_block[0];\n\n// 2. D222 Range parsing (Indices relative to start address 222)\nlet voltage = blocks.power_temp_block[0];\nlet amp = blocks.power_temp_block[1] / 100;\nlet power = blocks.power_temp_block[2] / 10;\nlet torque = blocks.power_temp_block[3] / 10;\nlet temperature = blocks.power_temp_block[8];\n\n// 3. D4110 High-Range parsing (Parsing REALs/Floats from registers)\nfunction parse32BitFloatSwapped(reg1, reg2) {\n    let buffer = new ArrayBuffer(4);\n    let view = new DataView(buffer);\n    view.setUint16(0, reg2, false);\n    view.setUint16(2, reg1, false);\n    let result = view.getFloat32(0, false);\n    return isNaN(result) ? 0 : result;\n}\n\nlet frequency = parse32BitFloatSwapped(blocks.control_metrics_block[0], blocks.control_metrics_block[1]);\nlet rpm = parse32BitFloatSwapped(blocks.control_metrics_block[2], blocks.control_metrics_block[3]);\n\n// 4. Calculate Speed Command and apply industrial state safety override\nlet speed_hz = blocks.control_metrics_block[102] / 200; // D4212 raw mapping\n\n// CRITICAL FIX: If motor is E-STOP (0) or STOPPED (1), force target speed command to 0 Hz\nif (statusCode === 0 || statusCode === 1) {\n    speed_hz = 0;\n}\n\n// ---------------------------------------------------------------\n// 5. D400 Range: EXTENDED VIBRATION BLOCK (new)\n//    PLC COM0 reads ONE 19-register block: sensor addr 52 (0x34)\n//    through 70 (0x46) -> D400..D418. Offsets below are relative\n//    to D400 = index 0 = sensor register 0x34. Reserved gaps are\n//    read but discarded (0x37-0x39, 0x3D-0x3F).\n//\n//    KNOWN LIMITATION (confirmed by controlled substitution test):\n//    AX/AY/AZ (offsets 0-2) read back as hard 0x0000 on this sensor\n//    unit regardless of PLC row/mapping. Velocity/temp/displacement/\n//    frequency in the SAME transaction are all valid, so the\n//    accelerometer itself is working (velocity is derived from it) -\n//    this looks like a firmware limitation on the raw-acceleration\n//    passthrough register specifically, not a dead sensor. Kept in\n//    the payload (as 0) rather than removed, so it's visible in\n//    Grafana as \"not yet resolved\" rather than silently missing.\n// ---------------------------------------------------------------\nlet vibExt = blocks.vib_extended_block;\n\n// Vibration velocity, now sourced HERE (offsets 6-8 = D406-408 =\n// sensor reg 0x3A-0x3C = VX,VY,VZ), matching the PLC variable table's\n// Motor_VBR_VX/VY/VZ. Same scaling as before: raw / 100 -> mm/s.\nlet vbr_x = vibExt[6] / 100;\nlet vbr_y = vibExt[7] / 100;\nlet vbr_z = vibExt[8] / 100;\n\n// Acceleration: A = signed_raw / 32768 * 16   [g]   (offsets 0-2)\n// Signed, because a real accelerometer swings both directions.\nlet accel_x = toSigned16(vibExt[0]) / 32768 * 16;\nlet accel_y = toSigned16(vibExt[1]) / 32768 * 16;\nlet accel_z = toSigned16(vibExt[2]) / 32768 * 16;\n\n// offsets 3-5 = reserved (0x37-0x39), discarded\n// offsets 6-8 = VX,VY,VZ (0x3A-0x3C) - duplicate of D200-202, not used here\n// offsets 9-11 = reserved (0x3D-0x3F), discarded\n\n// Sensor's own chip temperature = signed_raw / 100   [degC]  (offset 12)\n// NB: this is the SENSOR chip, NOT the motor. Motor temp is `temperature`\n// above (D230). Named distinctly on purpose so the two never get confused.\nlet sensor_chip_temp = toSigned16(vibExt[12]) / 100;\n\n// Vibration displacement: raw value is already in micrometres [um]  (13-15)\nlet disp_x = vibExt[13];\nlet disp_y = vibExt[14];\nlet disp_z = vibExt[15];\n\n// Dominant vibration frequency = raw / 10   [Hz]  (offsets 16-18)\nlet vib_freq_x = vibExt[16] / 10;\nlet vib_freq_y = vibExt[17] / 10;\nlet vib_freq_z = vibExt[18] / 10;\n\n// 6. Map Operational State Text Labels\nlet statusLabel = \"UNKNOWN\";\nswitch (statusCode) {\n    case 0: statusLabel = \"E-STOP\"; break;\n    case 1: statusLabel = \"STOPPED\"; break;\n    case 2: statusLabel = \"RUNNING\"; break;\n}\n\n// 7. Build Shared Identity Metadata\nlet identityTags = { asset_id: \"motor_01\" };\n\n// ==========================================\n// OUTPUT MESSAGE 1: Tailored for InfluxDB Out\n// ==========================================\nlet msgInflux = {\n    payload: {\n        vibration_x: safe(vbr_x),\n        vibration_y: safe(vbr_y),\n        vibration_z: safe(vbr_z),\n        temperature: safe(temperature),\n        current: safe(amp),\n        torque: safe(torque),\n        speed_command_hz: safe(speed_hz), // Safely drops to 0 on stop\n        frequency: frequency,\n        rpm: rpm,\n        voltage: safe(voltage),\n        power: safe(power),\n        status_code: statusCode,\n\n        // --- new extended vibration fields ---\n        accel_x: safe(accel_x),\n        accel_y: safe(accel_y),\n        accel_z: safe(accel_z),\n        sensor_chip_temp: safe(sensor_chip_temp),\n        disp_x: safe(disp_x),\n        disp_y: safe(disp_y),\n        disp_z: safe(disp_z),\n        vib_freq_x: safe(vib_freq_x),\n        vib_freq_y: safe(vib_freq_y),\n        vib_freq_z: safe(vib_freq_z)\n    },\n    tags: identityTags\n};\n\n// Clean out measurement property properties to keep Grafana rows clear\ndelete msgInflux.measurement;\n\n// ==========================================\n// OUTPUT MESSAGE 2: Tailored for Postgres Pipeline\n// ==========================================\nlet msgPostgres = {\n    payload: {\n        status_code: statusCode,\n        status_label: statusLabel\n    },\n    tags: identityTags\n};\n\nreturn [msgInflux, msgPostgres];\n",
+        "outputs": 2,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 880,
+        "y": 260,
+        "wires": [
+            [
+                "1f6902732eed5a6d"
+            ],
+            [
+                "812a42bd9fc1d123"
+            ]
+        ]
+    },
+    {
+        "id": "812a42bd9fc1d123",
+        "type": "rbe",
+        "z": "9d97c2693a2cda3c",
+        "name": "Filter Status Change",
+        "func": "rbe",
+        "gap": "",
+        "start": "",
+        "inout": "out",
+        "septopics": true,
+        "property": "payload.status_code",
+        "topi": "topic",
+        "x": 900,
+        "y": 340,
+        "wires": [
+            [
+                "a38453eacd73cf71"
+            ]
+        ]
+    },
+    {
+        "id": "a38453eacd73cf71",
+        "type": "function",
+        "z": "9d97c2693a2cda3c",
+        "name": "Format Postgres SQL",
+        "func": "let statusData = msg.payload;\nlet tagsData = msg.tags;\n\n// Assign the raw SQL string statement directly to msg.query\nmsg.query = `INSERT INTO machine_activity_logs (asset_id, status_code, status_label) \n             VALUES ('${tagsData.asset_id}', ${statusData.status_code}, '${statusData.status_label}');`;\n\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1140,
+        "y": 340,
+        "wires": [
+            [
+                "274bf60df785cdde"
+            ]
+        ]
+    },
+    {
+        "id": "1f6902732eed5a6d",
+        "type": "influxdb out",
+        "z": "9d97c2693a2cda3c",
+        "influxdb": "d993743d395f88e5",
+        "name": "Stream to InfluxDB",
+        "measurement": "motor_metrics",
+        "precision": "",
+        "retentionPolicy": "",
+        "database": "",
+        "precisionV18FluxV20": "ms",
+        "retentionPolicyV18Flux": "",
+        "org": "Factory_Module",
+        "bucket": "machine_telemetry",
+        "x": 910,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "274bf60df785cdde",
+        "type": "postgresql",
+        "z": "9d97c2693a2cda3c",
+        "name": "Commit Log to Postgres",
+        "query": "",
+        "postgreSQLConfig": "2ec18511ebcba630",
+        "split": false,
+        "rowsPerMsg": "",
+        "outputs": 1,
+        "x": 1150,
+        "y": 400,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "0ff5a3f81a676a13",
+        "type": "modbus-client",
+        "name": "",
+        "clienttype": "tcp",
+        "bufferCommands": true,
+        "stateLogEnabled": false,
+        "queueLogEnabled": false,
+        "failureLogEnabled": true,
+        "tcpHost": "192.168.0.30",
+        "tcpPort": 502,
+        "tcpType": "DEFAULT",
+        "serialPort": "/dev/ttyUSB",
+        "serialType": "RTU-BUFFERD",
+        "serialBaudrate": 9600,
+        "serialDatabits": 8,
+        "serialStopbits": 1,
+        "serialParity": "none",
+        "serialConnectionDelay": 100,
+        "serialAsciiResponseStartDelimiter": "0x3A",
+        "unit_id": 1,
+        "commandDelay": 1,
+        "clientTimeout": 1000,
+        "reconnectOnTimeout": true,
+        "reconnectTimeout": 2000,
+        "parallelUnitIdsAllowed": true,
+        "showErrors": false,
+        "showWarnings": true,
+        "showLogs": true
+    },
+    {
+        "id": "d993743d395f88e5",
+        "type": "influxdb",
+        "hostname": "influx",
+        "port": "8181",
+        "protocol": "http",
+        "database": "machine",
+        "name": "",
+        "usetls": false,
+        "tls": "",
+        "influxdbVersion": "2.0",
+        "url": "http://influxdb:8181",
+        "timeout": 10,
+        "rejectUnauthorized": false
+    },
+    {
+        "id": "2ec18511ebcba630",
+        "type": "postgreSQLConfig",
+        "name": "",
+        "host": "postgres",
+        "hostFieldType": "str",
+        "port": 5432,
+        "portFieldType": "num",
+        "database": "motor_db",
+        "databaseFieldType": "str",
+        "ssl": "false",
+        "sslFieldType": "bool",
+        "applicationName": "",
+        "applicationNameType": "str",
+        "max": 10,
+        "maxFieldType": "num",
+        "idle": 1000,
+        "idleFieldType": "num",
+        "connectionTimeout": 10000,
+        "connectionTimeoutFieldType": "num",
+        "user": "",
+        "userFieldType": "str",
+        "password": "",
+        "passwordFieldType": "str"
+    },
+    {
+        "id": "28c8691ee6a6bbc0",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-contrib-modbus": "5.45.2",
+            "node-red-contrib-influxdb": "0.7.0",
+            "node-red-contrib-postgresql": "0.15.4"
+        }
+    }
+]
