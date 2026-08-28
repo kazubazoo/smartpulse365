@@ -1,0 +1,15 @@
+# Loads every dashboard JSON under /var/lib/grafana/dashboards on startup, so a
+# fresh clone gets the prototype without anyone importing it by hand.
+apiVersion: 1
+
+providers:
+  - name: SmartPulse
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

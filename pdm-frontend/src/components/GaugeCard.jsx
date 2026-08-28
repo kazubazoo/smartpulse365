@@ -4,7 +4,7 @@ function GaugeCard({ label, value, unit, max, min = 0, color = '#38BDF8', decima
 
   return (
     <div className="bg-bg-panel border border-border-glow rounded-xl p-4 flex flex-col items-center">
-      <span className="font-body text-xs tracking-widest uppercase text-slate-400 mb-1 self-start">{label}</span>
+      <span className="font-body text-xs tracking-widest uppercase text-slate-100 mb-1 self-start">{label}</span>
       <svg viewBox="0 0 120 68" className="w-full max-w-[170px] mt-1">
         {/* Background track */}
         <path

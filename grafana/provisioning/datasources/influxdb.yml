@@ -1,0 +1,19 @@
+# Datasource the prototype dashboard binds to. The uid is fixed because the
+# dashboard JSON references it by uid — change one and you must change both.
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: ffs9dyoc7pibkc
+    access: proxy
+    url: http://influxdb:8181
+    isDefault: true
+    jsonData:
+      version: SQL
+      dbName: machine_telemetry
+      httpMode: POST
+      insecureGrpc: true
+    secureJsonData:
+      token: ${INFLUXDB3_AUTH_TOKEN}
+    editable: false

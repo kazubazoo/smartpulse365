@@ -6,7 +6,7 @@ function HealthScoreCard({ health }) {
     <div className="bg-bg-panel border border-border-glow rounded-xl p-4 flex flex-col justify-center gap-2">
       <div className="flex items-center gap-2">
         <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: color }} />
-        <span className="font-body text-xs tracking-widest uppercase text-slate-400">
+        <span className="font-body text-xs tracking-widest uppercase text-slate-100">
           System Health Score (ISO 10816)
         </span>
       </div>

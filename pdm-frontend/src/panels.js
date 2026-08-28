@@ -42,3 +42,7 @@ export const ACCELERATION = [
   { name: 'Y', field: 'accel_y', color: '#34D399' },
   { name: 'Z', field: 'accel_z', color: '#2563EB' },
 ]
+export const THERMAL = [
+  { name: 'MotorTemp', field: 'temperature', color: '#FB923C' },
+  { name: 'SensorChipTemp', field: 'sensor_chip_temp', color: '#94A3B8', dash: '6 4', width: 1.5 },
+]

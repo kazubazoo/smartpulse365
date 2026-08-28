@@ -1,0 +1,8 @@
+FROM nodered/node-red:latest
+
+# Palette nodes required by node-red-flows/flows.json (see README section 5).
+# Versions pinned to the global-config block of the exported flow.
+RUN npm install --unsafe-perm --no-update-notifier --no-audit --no-fund \
+      node-red-contrib-modbus@5.45.2 \
+      node-red-contrib-influxdb@0.7.0 \
+      node-red-contrib-postgresql@0.15.4

@@ -10,7 +10,7 @@ function RootCauseHistoryTable({ rows }) {
     <div className="bg-bg-panel border border-border-glow rounded-xl p-4 flex flex-col">
       <div className="flex items-center gap-2 mb-3">
         <span className="w-1.5 h-1.5 rounded-full bg-accent-cyan animate-pulse" />
-        <span className="font-body text-xs tracking-widest uppercase text-slate-400">Root Cause History</span>
+        <span className="font-body text-xs tracking-widest uppercase text-slate-100">Root Cause History</span>
       </div>
       {rows.length === 0 ? (
         <p className="text-slate-500 text-xs">No data</p>

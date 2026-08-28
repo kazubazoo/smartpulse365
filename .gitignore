@@ -8,3 +8,11 @@ node_red_data/
 ollama_data/
 postgres_data/
 mosquitto/
+
+pdm-backend/__pycache__/
+__pycache__/
+*.pyc
+influxdb_explorer_data/
+
+# Local-only port/service tweaks; never committed (see .env.example)
+docker-compose.override.yml

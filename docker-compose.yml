@@ -4,8 +4,8 @@ services:
     image: eclipse-mosquitto
     container_name: mosquitto
     ports:
-      - "1883:1883"
-      - "9001:9001"
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_WS_PORT:-9001}:9001"
     volumes:
       - ./mosquitto/config:/mosquitto/config
       - ./mosquitto/data:/mosquitto/data
@@ -20,9 +20,11 @@ services:
       POSTGRES_DB: motor_db
       TZ: "Asia/Kuala_Lumpur"
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data 
+      - ./postgres_data:/var/lib/postgresql/data
+      # Runs once, when the data directory is first created.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
 
   influxdb:
     image: influxdb:3-core
@@ -30,15 +32,34 @@ services:
     user: "root"
     entrypoint: ["influxdb3", "serve", "--node-id=node0", "--object-store=file", "--data-dir=/var/lib/influxdb3/data"]
     ports:
-      - "8181:8181"
+      - "${INFLUXDB_PORT:-8181}:8181"
     volumes:
       - ./influxdb_data:/var/lib/influxdb3/data
 
+  # Web GUI for InfluxDB 3: browse databases, run SQL, inspect tables. InfluxDB
+  # 3 Core ships no built-in UI of its own, so this fills the role the InfluxDB
+  # 2.x web interface used to play.
+  influxdb-explorer:
+    image: quay.io/influxdb/influxdb3-explorer:latest
+    container_name: influxdb-explorer
+    ports:
+      - "${INFLUXDB_EXPLORER_PORT:-8888}:80"
+      - "${INFLUXDB_EXPLORER_API_PORT:-8889}:8888"
+    volumes:
+      - ./influxdb_explorer_data:/db-data
+    depends_on:
+      - influxdb
+
   node-red:
-    image: nodered/node-red:latest
+    # Built rather than pulled: flows.json needs the modbus / influxdb /
+    # postgresql palette nodes, which the stock image does not ship.
+    build:
+      context: .
+      dockerfile: Dockerfile.node-red
+    image: smartpulse365-node-red
     container_name: node-red
     ports:
-      - "1880:1880"
+      - "${NODE_RED_PORT:-1880}:1880"
     volumes:
       - ./node_red_data:/data 
     depends_on:
@@ -50,14 +71,22 @@ services:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s 
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
       GF_PANELS_DISABLE_SANITIZE_HTML: true
       GF_PANELS_ALLOW_EMBED: true
+      # Expanded inside provisioning/datasources/influxdb.yml
+      INFLUXDB3_AUTH_TOKEN: ${INFLUXDB3_AUTH_TOKEN}
+      # Land on the prototype dashboard instead of an empty home page
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/motor01-prototype.json
     volumes:
       - ./grafana_data:/var/lib/grafana
+      # Provisioned on every start, so a fresh clone gets the datasource and the
+      # dashboard without anyone importing anything by hand.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - postgres
       - influxdb
@@ -66,9 +95,16 @@ services:
     build: ./pdm-backend
     container_name: api
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
       INFLUXDB3_AUTH_TOKEN: ${INFLUXDB3_AUTH_TOKEN}
+      # Blank disables auth enforcement; set both to require a Supabase session.
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      # Assets this deployment monitors, as "id:Display Name" pairs. Listed
+      # machines stay visible when they stop reporting, shown as offline.
+      MACHINES: ${MACHINES:-motor01:Motor 01}
+      ONLINE_WINDOW_SECONDS: ${ONLINE_WINDOW_SECONDS:-30}
     depends_on:
       - influxdb
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload

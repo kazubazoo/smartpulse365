@@ -1,0 +1,19 @@
+# Used by the prototype dashboard's "Motor Status" panel, which reads the
+# status-change log the Node-RED flow writes. The uid is fixed to match the
+# reference inside the dashboard JSON.
+apiVersion: 1
+
+datasources:
+  - name: PostgreSQL
+    type: grafana-postgresql-datasource
+    uid: cfs9bmi6hz8qoa
+    access: proxy
+    url: postgres:5432
+    user: admin
+    jsonData:
+      database: motor_db
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: admin
+    editable: false
