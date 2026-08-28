@@ -98,28 +98,105 @@ and the API route. All three must agree, or a machine shows no data.
 
 Requires Docker Desktop and Node.js 20+.
 
+On a fresh clone the pipeline is **inert until Node-RED is set up** (step 5).
+Docker starts every container, but nothing polls the PLC and nothing writes to
+InfluxDB until you import and deploy the acquisition flow — so the dashboard
+correctly shows every machine `OFFLINE` until then. Registering a machine, or a
+passing *Test connection*, does not change this.
+
+### 1. Clone and configure
+
 ```bash
 git clone https://github.com/kazubazoo/smartpulse365.git
 cd smartpulse365
 cp .env.example .env
+```
 
-# The token can only be minted once the server is running, and is shown once.
+### 2. Create the Mosquitto config
+
+`mosquitto/` is gitignored, so `mosquitto/config/mosquitto.conf` does not exist
+on a fresh clone. The `eclipse-mosquitto` image exits immediately without it and
+Docker restart-loops the container. Create a minimal one:
+
+```bash
+mkdir -p mosquitto/config
+cat > mosquitto/config/mosquitto.conf <<'EOF'
+listener 1883
+allow_anonymous true
+listener 9001
+protocol websockets
+persistence true
+persistence_location /mosquitto/data/
+log_dest stdout
+EOF
+```
+
+The MQTT broker is infrastructure only — the acquisition flow writes straight to
+InfluxDB and Postgres — but the container should still start cleanly.
+
+### 3. Mint the InfluxDB token
+
+The admin token can only be created once the server is running, and is shown
+once:
+
+```bash
 docker compose up -d influxdb
 docker compose exec influxdb influxdb3 create token --admin
 # → paste the apiv3_... value into .env as INFLUXDB3_AUTH_TOKEN
+```
 
+### 4. Start the stack
+
+```bash
 docker compose up -d --build
+```
 
+The `machine_telemetry` database and its tables are created automatically on the
+first write from Node-RED — no further InfluxDB CLI work.
+
+### 5. Set up Node-RED — required, nothing works without this
+
+`node-red-flows/flows.json` is the portable *definition* of the acquisition
+flow; it is not loaded automatically. Import it once:
+
+1. Open http://localhost:1880 → Menu (☰) → **Import** → select
+   `node-red-flows/flows.json` → **Import** → **Deploy**.
+2. Double-click the **Modbus** client config node (pencil next to the *Server*
+   field on any `D…` read node) and set the PLC's **Host**, **Port** (usually
+   `502`) and **Unit-Id**.
+3. Double-click **Stream to InfluxDB** → pencil next to the *Server* field, and
+   set:
+   - **Version**: `2.0`
+   - **URL**: `http://influxdb:8181`
+   - **Token**: the `apiv3_…` token from `.env`
+   - **Organization**: `Factory_Module`  **Bucket**: `machine_telemetry`
+4. In the **Map, Scale & Process Buffer** function node, set `machineId` to the
+   Machine ID you will register (default `motor01`).
+5. **Deploy** again.
+
+Watch the debug sidebar and InfluxDB Explorer (http://localhost:8888): rows
+tagged with your `machine_id` should appear within a second or two. Writes that
+fail with `401 Unauthorized` mean the **Token** field in step 3 is empty or
+wrong.
+
+> Node-RED keeps that token in `node_red_data/` (gitignored). Deleting that
+> directory loses the credential — re-enter it in step 3 and redeploy.
+
+### 6. Build and open the dashboard
+
+```bash
 cd pdm-frontend
 npm ci && npm run build && npm run preview     # http://localhost:4173
 ```
 
-Databases and tables are created automatically on first write — no further CLI
-work.
-
 > Use `npm run build && npm run preview`, never `npm run dev`. React 19's
 > dev-mode instrumentation leaks memory outside the V8 heap and will eventually
 > crash the tab at this data rate.
+
+Without Supabase (see below) the dashboard opens straight to the Overview. Add
+the machine on the **Machines** page using the same Machine ID you set in
+Node-RED step 4; it flips from `OFFLINE` to `RUNNING`/`IDLE` within 30 seconds
+of the first row.
 
 ### Services
 
@@ -188,13 +265,17 @@ and a device that actually answers.
 
 ### 2. Point Node-RED at the PLC
 
-Open Node-RED, import `node-red-flows/flows.json` (Menu → Import), then:
+Open Node-RED, import `node-red-flows/flows.json` (Menu → Import → Deploy), then
+edit the config nodes:
 
-- set the PLC's IP on the Modbus server config node,
-- paste the InfluxDB token into the InfluxDB config node,
-- set `machineId` in the *Map, Scale & Process Buffer* function to match the
-  Machine ID you registered,
-- Deploy.
+- **Modbus client** — the PLC's **Host** / **Port** / **Unit-Id**.
+- **Stream to InfluxDB** (server config, pencil icon) — **Version** `2.0`,
+  **URL** `http://influxdb:8181`, **Token** = the `apiv3_…` value from `.env`,
+  **Organization** `Factory_Module`, **Bucket** `machine_telemetry`. An empty or
+  stale token shows up as repeated `401 Unauthorized` write errors in the log.
+- **Map, Scale & Process Buffer** function — set `machineId` to match the
+  Machine ID you registered.
+- **Deploy**.
 
 The flow reads four register blocks in parallel once per second, joins them,
 converts raw integers to engineering units (signed 16-bit reinterpretation for
@@ -224,17 +305,22 @@ Overview flips to `RUNNING` within 30 seconds of the first write.
 Skip this to run unauthenticated on an isolated plant network.
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. Run `supabase/schema.sql` in the SQL Editor. It creates `user_settings` and
-   `machines` with Row Level Security policies restricting each account to its
-   own settings.
-3. Copy the **Project URL** and **anon/publishable key** from Project Settings →
-   API into:
+2. Run `supabase/schema.sql` in the SQL Editor (Dashboard → SQL Editor → New
+   query). It creates `user_settings` and `machines` with Row Level Security
+   policies restricting each account to its own settings, and seeds
+   `motor01`–`motor04`. Safe to re-run.
+3. From Project Settings → API copy the **Project URL** and an **anon key** —
+   the long `eyJ…` JWT is the most broadly compatible — into **both** places
+   (the values must match):
    - `.env` as `SUPABASE_URL` / `SUPABASE_ANON_KEY`
    - `pdm-frontend/.env.local` as `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`
+     (copy it from `pdm-frontend/.env.example`)
 4. Under Authentication → Sign In / Providers → Email, turn **Confirm email**
    off for a bench setup and **Allow new users to sign up** off so accounts are
-   invite-only. Create operators under Authentication → Users.
-5. `docker compose up -d api` and rebuild the frontend.
+   invite-only. Then create at least one operator under Authentication → Users —
+   there is no sign-up screen, so without a user you cannot log in.
+5. `docker compose up -d api` (picks up the API-side vars) and rebuild the
+   frontend (`npm run build && npm run preview`).
 
 `VITE_*` variables are inlined at **build** time — changing them requires a
 rebuild, not a restart.

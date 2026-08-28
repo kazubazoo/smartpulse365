@@ -86,20 +86,40 @@ local-only tweaks; do not commit one.
 
 ## Setup on a fresh clone
 
-Full walkthrough in README §7. The order matters:
+Full walkthrough in README "Quick start". The order matters, and **the pipeline
+produces no data until the Node-RED flow is imported and deployed** (step 5) —
+until then every machine is correctly `OFFLINE`. `docker compose up` alone is
+not enough.
 
 1. `cp .env.example .env`
-2. `docker compose up -d influxdb` then
+2. Create `mosquitto/config/mosquitto.conf`. `mosquitto/` is gitignored, so the
+   file is absent on a fresh clone and the `eclipse-mosquitto` image crash-loops
+   without it. A minimal anonymous listener on 1883 plus websockets on 9001 is
+   enough. MQTT is not on the acquisition path (the flow writes straight to
+   InfluxDB and Postgres) but the container should still start.
+3. `docker compose up -d influxdb` then
    `docker compose exec influxdb influxdb3 create token --admin` — the token
-   cannot be minted before the server runs, and is shown only once.
-3. Put it in `.env`, then `docker compose up -d --build`.
-4. Optional Supabase: run `supabase/schema.sql`, fill `SUPABASE_URL` /
-   `SUPABASE_ANON_KEY` in `.env` **and** `VITE_SUPABASE_URL` /
-   `VITE_SUPABASE_ANON_KEY` in `pdm-frontend/.env.local`.
-5. `cd pdm-frontend && npm ci && npm run build && npm run preview`
+   cannot be minted before the server runs, and is shown only once. Put it in
+   `.env` as `INFLUXDB3_AUTH_TOKEN`.
+4. `docker compose up -d --build`.
+5. Node-RED (**required**): open :1880, Menu → Import `node-red-flows/flows.json`,
+   Deploy. Then edit the config nodes — Modbus client host/port/unit-id, and on
+   the **Stream to InfluxDB** server config set Version `2.0`, URL
+   `http://influxdb:8181`, Token = the `apiv3_` token, Organization
+   `Factory_Module`, Bucket `machine_telemetry`. Set `machineId` in the *Map,
+   Scale & Process Buffer* function. Deploy again. Confirm rows land in InfluxDB
+   Explorer (:8888); repeated `401 Unauthorized` in the log means the token
+   field is empty or wrong.
+6. Optional Supabase: run `supabase/schema.sql` in the SQL Editor, then put the
+   Project URL and an anon key (the long `eyJ…` JWT is the most compatible) in
+   **both** `.env` (`SUPABASE_URL` / `SUPABASE_ANON_KEY`) and
+   `pdm-frontend/.env.local` (`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`).
+   Create at least one user under Authentication → Users — there is no sign-up
+   screen. `docker compose up -d api` to load the API-side vars.
+7. `cd pdm-frontend && npm ci && npm run build && npm run preview`
 
-Databases and tables are created automatically on first write — no CLI beyond
-the token step.
+Databases and tables are created automatically on the first write from Node-RED
+— no InfluxDB CLI beyond the token step.
 
 `VITE_*` variables are inlined at build time. Changing them requires a rebuild,
 not a restart.
@@ -164,6 +184,26 @@ is a separate question answered by `POST /api/connectivity/test`.
 
 ## Traps already hit here
 
+- **The Node-RED flow is not auto-loaded on a fresh clone.** The container
+  starts with an empty workspace; `node-red-flows/flows.json` must be imported
+  through the editor (Menu → Import) and deployed. Nothing polls the PLC and
+  nothing reaches InfluxDB until then, so every machine reads `OFFLINE` — that
+  is correct, not a bug. Connecting the PLC or a passing *Test connection* on
+  the Machines page does not start acquisition.
+- **Injecting Node-RED credentials via the Admin API does not persist them.**
+  `POST /flows` with an inline `credentials` block on a config node is silently
+  dropped. The InfluxDB token must be typed into the **Stream to InfluxDB**
+  server config in the editor and deployed, or written to
+  `node_red_data/flows_cred.json` — plaintext only if `credentialSecret: false`
+  is set in `node_red_data/settings.js`, otherwise AES-encrypted with the
+  system key from `.config.runtime.json`. Symptom of a missing token: repeated
+  `401 Unauthorized` write errors in the Node-RED log while Modbus reads
+  themselves succeed.
+- **`mosquitto` crash-loops on a fresh clone.** `mosquitto/` is gitignored, so
+  `mosquitto/config/mosquitto.conf` is absent and the `eclipse-mosquitto` image
+  exits on startup (`Unable to open config file`). Create the file — see
+  "Setup on a fresh clone". MQTT is not on the acquisition path, so the rest of
+  the stack runs fine meanwhile.
 - **`node-red-contrib-influxdb` ignores `msg.tags`.** Tags only reach InfluxDB
   when the payload is `[fields, tags]`. Setting `msg.tags` silently drops them.
 - **`{}` is truthy.** `/latest` returns `{}` when there is no data; guarding
