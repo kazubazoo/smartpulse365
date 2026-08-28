@@ -1,4 +1,4 @@
-# SmartPulse 365 — Predictive Maintenance Module
+# Predictive Maintenance Module
 
 A self-contained condition-monitoring dashboard for industrial motors. It polls
 a PLC over Modbus TCP, stores the readings as time-series data, scores machine
