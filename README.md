@@ -263,6 +263,43 @@ a real socket from the API container and sends a Modbus *Read Holding Registers*
 frame, distinguishing a timeout, a refused connection, an unresolvable hostname
 and a device that actually answers.
 
+### MQTT publishing to the Novaflow broker
+
+The flow publishes every reading to the company Mosquitto broker alongside the
+InfluxDB write, following the *Node-RED MQTT Publishing Guideline v1.0*.
+
+- Topic `pmm/<site_id>/<device_id>` (default `pmm/SITE001/MOTOR001`), QoS 1,
+  retain false.
+- Site and device identity are constants at the top of the
+  **Build MQTT Payload** function node.
+- Broker host, port and client ID are in the flow; **username and password are
+  not** — Node-RED keeps those in `flows_cred.json`, which is gitignored. Enter
+  them once in the editor after importing.
+
+**All measurements are transmitted as scaled integers.** Each value is
+multiplied by its factor and rounded; consumers divide by the same factor. The
+factors match the precision the sensor actually reports, so the transmitted
+integer is generally the raw Modbus register value again — nothing invented,
+nothing lost.
+
+| Field | Factor | Example |
+|---|---|---|
+| `motor_frequency` | 100 | 49.97 Hz → `4997` |
+| `motor_RPM` | 10 | 1452.4 rpm → `14524` |
+| `motor_amp` | 100 | 4.48 A → `448` |
+| `motor_power` / `motor_torque` | 10 | 2.2 kW → `22` |
+| `motor_VBR_chiptemp` | 100 | 31.50 °C → `3150` |
+| `motor_VBR_V*` (velocity) | 100 | 1.24 mm/s → `124` |
+| `motor_VBR_A*` (acceleration) | 1000 | 0.122 g → `122` (milli-g) |
+| `motor_VBR_F*` (frequency) | 10 | 24.6 Hz → `246` |
+| `motor_VBR_D*`, `motor_volt`, `motor_temperature`, `motor_status`, `motor_VBR_fault*` | 1 | already whole units |
+
+The factors live in one `SCALE` table at the top of the function node.
+
+`invt_bus_volt` is published as `null` — the VFD DC bus voltage register is not
+part of any current Modbus block. Null rather than `0` so a consumer can tell
+"not measured" from "measured as zero".
+
 ### 2. Point Node-RED at the PLC
 
 Open Node-RED, import `node-red-flows/flows.json` (Menu → Import → Deploy), then

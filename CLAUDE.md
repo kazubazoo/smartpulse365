@@ -235,6 +235,23 @@ there expecting it to be shared.
   is created by `postgres/init/`. That init directory only runs when the
   postgres volume is first created; apply changes by hand to an existing volume.
 
+## MQTT publishing
+
+The acquisition flow publishes to the company broker as a **third branch off
+the existing function node's InfluxDB output** — the branch was added by
+appending one wire, never by editing the working function. Keep it that way:
+InfluxDB stays first in the wire list so it receives the original message
+object, and the MQTT function returns a new message rather than mutating `msg`.
+
+- Payload is scaled integers per the Novaflow guideline; factors are in a
+  single `SCALE` table at the top of *Build MQTT Payload*.
+- `dts` is `YYYY-MM-DD HH:mm:ss`. The source PDF contradicts itself on this
+  (its section 2 table shows DD-MM-YYYY); section 6.1 is authoritative.
+- Unread registers publish as `null`, never `0`.
+- The extended-vibration Modbus read covers **D400-D421** (22 registers):
+  acceleration at offsets 0-2, velocity 6-8, chip temp 12, displacement 13-15,
+  frequency 16-18, fault codes 19-21.
+
 ## Frontend conventions
 
 - Context objects and their hooks live in `contexts/*Store.js`; the provider

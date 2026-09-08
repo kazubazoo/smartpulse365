@@ -109,7 +109,7 @@
         "id": "dc6ad1bf03b2751e",
         "type": "modbus-read",
         "z": "9d97c2693a2cda3c",
-        "name": "D400-D418: Extended Vibration",
+        "name": "D400-D421: Extended Vibration & Faults",
         "topic": "vib_extended_block",
         "showStatusActivities": true,
         "logIOActivities": false,
@@ -118,7 +118,7 @@
         "unitid": "1",
         "dataType": "HoldingRegister",
         "adr": "400",
-        "quantity": "19",
+        "quantity": "22",
         "rate": "1",
         "rateUnit": "s",
         "delayOnStart": false,
@@ -172,7 +172,7 @@
         "type": "function",
         "z": "9d97c2693a2cda3c",
         "name": "Map, Scale & Process Buffer",
-        "func": "let blocks = msg.payload;\n\n// Guard clause to ensure all network blocks arrived safely\nif (!blocks.vbr_status_block || !blocks.power_temp_block ||\n    !blocks.control_metrics_block || !blocks.vib_extended_block) return null;\n\n// ---------------------------------------------------------------\n// HELPER: Modbus registers arrive as UNSIGNED 16-bit (0..65535).\n// Sensor values that can legitimately be negative (acceleration,\n// chip temperature below 0 degC) are 16-bit SIGNED and must be\n// re-interpreted, or -0.5g would read as +65535-ish garbage.\n// ---------------------------------------------------------------\nfunction toSigned16(v) {\n    return v > 32767 ? v - 65536 : v;\n}\n\nfunction safe(v) {\n    return (typeof v === \"number\" && isFinite(v)) ? v : 0;\n}\n\n// 1. D210 Motor Status (block now contains only this single register)\nlet statusCode = blocks.vbr_status_block[0];\n\n// 2. D222 Range parsing (Indices relative to start address 222)\nlet voltage = blocks.power_temp_block[0];\nlet amp = blocks.power_temp_block[1] / 100;\nlet power = blocks.power_temp_block[2] / 10;\nlet torque = blocks.power_temp_block[3] / 10;\nlet temperature = blocks.power_temp_block[8];\n\n// 3. D4110 High-Range parsing (Parsing REALs/Floats from registers)\nfunction parse32BitFloatSwapped(reg1, reg2) {\n    let buffer = new ArrayBuffer(4);\n    let view = new DataView(buffer);\n    view.setUint16(0, reg2, false);\n    view.setUint16(2, reg1, false);\n    let result = view.getFloat32(0, false);\n    return isNaN(result) ? 0 : result;\n}\n\nlet frequency = parse32BitFloatSwapped(blocks.control_metrics_block[0], blocks.control_metrics_block[1]);\nlet rpm = parse32BitFloatSwapped(blocks.control_metrics_block[2], blocks.control_metrics_block[3]);\n\n// 4. Calculate Speed Command and apply industrial state safety override\nlet speed_hz = blocks.control_metrics_block[102] / 200; // D4212 raw mapping\n\n// CRITICAL FIX: If motor is E-STOP (0) or STOPPED (1), force target speed command to 0 Hz\nif (statusCode === 0 || statusCode === 1) {\n    speed_hz = 0;\n}\n\n// ---------------------------------------------------------------\n// 5. D400 Range: EXTENDED VIBRATION BLOCK (new)\n//    PLC COM0 reads ONE 19-register block: sensor addr 52 (0x34)\n//    through 70 (0x46) -> D400..D418. Offsets below are relative\n//    to D400 = index 0 = sensor register 0x34. Reserved gaps are\n//    read but discarded (0x37-0x39, 0x3D-0x3F).\n//\n//    KNOWN LIMITATION (confirmed by controlled substitution test):\n//    AX/AY/AZ (offsets 0-2) read back as hard 0x0000 on this sensor\n//    unit regardless of PLC row/mapping. Velocity/temp/displacement/\n//    frequency in the SAME transaction are all valid, so the\n//    accelerometer itself is working (velocity is derived from it) -\n//    this looks like a firmware limitation on the raw-acceleration\n//    passthrough register specifically, not a dead sensor. Kept in\n//    the payload (as 0) rather than removed, so it's visible in\n//    Grafana as \"not yet resolved\" rather than silently missing.\n// ---------------------------------------------------------------\nlet vibExt = blocks.vib_extended_block;\n\n// Vibration velocity, now sourced HERE (offsets 6-8 = D406-408 =\n// sensor reg 0x3A-0x3C = VX,VY,VZ), matching the PLC variable table's\n// Motor_VBR_VX/VY/VZ. Same scaling as before: raw / 100 -> mm/s.\nlet vbr_x = vibExt[6] / 100;\nlet vbr_y = vibExt[7] / 100;\nlet vbr_z = vibExt[8] / 100;\n\n// Acceleration: A = signed_raw / 32768 * 16   [g]   (offsets 0-2)\n// Signed, because a real accelerometer swings both directions.\nlet accel_x = toSigned16(vibExt[0]) / 32768 * 16;\nlet accel_y = toSigned16(vibExt[1]) / 32768 * 16;\nlet accel_z = toSigned16(vibExt[2]) / 32768 * 16;\n\n// offsets 3-5 = reserved (0x37-0x39), discarded\n// offsets 6-8 = VX,VY,VZ (0x3A-0x3C) - duplicate of D200-202, not used here\n// offsets 9-11 = reserved (0x3D-0x3F), discarded\n\n// Sensor's own chip temperature = signed_raw / 100   [degC]  (offset 12)\n// NB: this is the SENSOR chip, NOT the motor. Motor temp is `temperature`\n// above (D230). Named distinctly on purpose so the two never get confused.\nlet sensor_chip_temp = toSigned16(vibExt[12]) / 100;\n\n// Vibration displacement: raw value is already in micrometres [um]  (13-15)\nlet disp_x = vibExt[13];\nlet disp_y = vibExt[14];\nlet disp_z = vibExt[15];\n\n// Dominant vibration frequency = raw / 10   [Hz]  (offsets 16-18)\nlet vib_freq_x = vibExt[16] / 10;\nlet vib_freq_y = vibExt[17] / 10;\nlet vib_freq_z = vibExt[18] / 10;\n\n// 6. Map Operational State Text Labels\nlet statusLabel = \"UNKNOWN\";\nswitch (statusCode) {\n    case 0: statusLabel = \"E-STOP\"; break;\n    case 1: statusLabel = \"STOPPED\"; break;\n    case 2: statusLabel = \"RUNNING\"; break;\n}\n\n// 7. Build Shared Identity Metadata\n// The machine this flow is polling. It MUST match the Machine ID\n// registered in the dashboard \u2014 that string is what links these\n// readings to the right machine everywhere downstream.\nlet machineId = \"motor01\";\nlet identityTags = { asset_id: machineId };\n\n// ==========================================\n// OUTPUT MESSAGE 1: Tailored for InfluxDB Out\n// ==========================================\nlet msgInflux = {\n    payload: [\n        {\n        vibration_x: safe(vbr_x),\n        vibration_y: safe(vbr_y),\n        vibration_z: safe(vbr_z),\n        temperature: safe(temperature),\n        current: safe(amp),\n        torque: safe(torque),\n        speed_command_hz: safe(speed_hz), // Safely drops to 0 on stop\n        frequency: frequency,\n        rpm: rpm,\n        voltage: safe(voltage),\n        power: safe(power),\n        status_code: statusCode,\n\n        // --- new extended vibration fields ---\n        accel_x: safe(accel_x),\n        accel_y: safe(accel_y),\n        accel_z: safe(accel_z),\n        sensor_chip_temp: safe(sensor_chip_temp),\n        disp_x: safe(disp_x),\n        disp_y: safe(disp_y),\n        disp_z: safe(disp_z),\n        vib_freq_x: safe(vib_freq_x),\n        vib_freq_y: safe(vib_freq_y),\n        vib_freq_z: safe(vib_freq_z)\n    },\n        { machine_id: machineId }\n    ]\n};\n\n// Clean out measurement property properties to keep Grafana rows clear\ndelete msgInflux.measurement;\n\n// ==========================================\n// OUTPUT MESSAGE 2: Tailored for Postgres Pipeline\n// ==========================================\nlet msgPostgres = {\n    payload: {\n        status_code: statusCode,\n        status_label: statusLabel\n    },\n    tags: identityTags\n};\n\nreturn [msgInflux, msgPostgres];\n",
+        "func": "let blocks = msg.payload;\n\n// Guard clause to ensure all network blocks arrived safely\nif (!blocks.vbr_status_block || !blocks.power_temp_block ||\n    !blocks.control_metrics_block || !blocks.vib_extended_block) return null;\n\n// ---------------------------------------------------------------\n// HELPER: Modbus registers arrive as UNSIGNED 16-bit (0..65535).\n// Sensor values that can legitimately be negative (acceleration,\n// chip temperature below 0 degC) are 16-bit SIGNED and must be\n// re-interpreted, or -0.5g would read as +65535-ish garbage.\n// ---------------------------------------------------------------\nfunction toSigned16(v) {\n    return v > 32767 ? v - 65536 : v;\n}\n\nfunction safe(v) {\n    return (typeof v === \"number\" && isFinite(v)) ? v : 0;\n}\n\n// 1. D210 Motor Status (block now contains only this single register)\nlet statusCode = blocks.vbr_status_block[0];\n\n// 2. D222 Range parsing (Indices relative to start address 222)\nlet voltage = blocks.power_temp_block[0];\nlet amp = blocks.power_temp_block[1] / 100;\nlet power = blocks.power_temp_block[2] / 10;\nlet torque = blocks.power_temp_block[3] / 10;\nlet temperature = blocks.power_temp_block[8];\n\n// 3. D4110 High-Range parsing (Parsing REALs/Floats from registers)\nfunction parse32BitFloatSwapped(reg1, reg2) {\n    let buffer = new ArrayBuffer(4);\n    let view = new DataView(buffer);\n    view.setUint16(0, reg2, false);\n    view.setUint16(2, reg1, false);\n    let result = view.getFloat32(0, false);\n    return isNaN(result) ? 0 : result;\n}\n\nlet frequency = parse32BitFloatSwapped(blocks.control_metrics_block[0], blocks.control_metrics_block[1]);\nlet rpm = parse32BitFloatSwapped(blocks.control_metrics_block[2], blocks.control_metrics_block[3]);\n\n// 4. Calculate Speed Command and apply industrial state safety override\nlet speed_hz = blocks.control_metrics_block[102] / 200; // D4212 raw mapping\n\n// CRITICAL FIX: If motor is E-STOP (0) or STOPPED (1), force target speed command to 0 Hz\nif (statusCode === 0 || statusCode === 1) {\n    speed_hz = 0;\n}\n\n// ---------------------------------------------------------------\n// 5. D400 Range: EXTENDED VIBRATION BLOCK (new)\n//    PLC COM0 reads ONE 22-register block: sensor addr 52 (0x34)\n//    through 73 (0x49) -> D400..D421. Offsets below are relative\n//    to D400 = index 0 = sensor register 0x34. Reserved gaps are\n//    read but discarded (0x37-0x39, 0x3D-0x3F).\n//\n//    KNOWN LIMITATION (confirmed by controlled substitution test):\n//    AX/AY/AZ (offsets 0-2) read back as hard 0x0000 on this sensor\n//    unit regardless of PLC row/mapping. Velocity/temp/displacement/\n//    frequency in the SAME transaction are all valid, so the\n//    accelerometer itself is working (velocity is derived from it) -\n//    this looks like a firmware limitation on the raw-acceleration\n//    passthrough register specifically, not a dead sensor. Kept in\n//    the payload (as 0) rather than removed, so it's visible in\n//    Grafana as \"not yet resolved\" rather than silently missing.\n// ---------------------------------------------------------------\nlet vibExt = blocks.vib_extended_block;\n\n// Vibration velocity, now sourced HERE (offsets 6-8 = D406-408 =\n// sensor reg 0x3A-0x3C = VX,VY,VZ), matching the PLC variable table's\n// Motor_VBR_VX/VY/VZ. Same scaling as before: raw / 100 -> mm/s.\nlet vbr_x = vibExt[6] / 100;\nlet vbr_y = vibExt[7] / 100;\nlet vbr_z = vibExt[8] / 100;\n\n// Acceleration: A = signed_raw / 32768 * 16   [g]   (offsets 0-2)\n// Signed, because a real accelerometer swings both directions.\nlet accel_x = toSigned16(vibExt[0]) / 32768 * 16;\nlet accel_y = toSigned16(vibExt[1]) / 32768 * 16;\nlet accel_z = toSigned16(vibExt[2]) / 32768 * 16;\n\n// offsets 3-5 = reserved (0x37-0x39), discarded\n// offsets 6-8 = VX,VY,VZ (0x3A-0x3C) - duplicate of D200-202, not used here\n// offsets 9-11 = reserved (0x3D-0x3F), discarded\n\n// Sensor's own chip temperature = signed_raw / 100   [degC]  (offset 12)\n// NB: this is the SENSOR chip, NOT the motor. Motor temp is `temperature`\n// above (D230). Named distinctly on purpose so the two never get confused.\nlet sensor_chip_temp = toSigned16(vibExt[12]) / 100;\n\n// Vibration displacement: raw value is already in micrometres [um]  (13-15)\nlet disp_x = vibExt[13];\nlet disp_y = vibExt[14];\nlet disp_z = vibExt[15];\n\n// Dominant vibration frequency = raw / 10   [Hz]  (offsets 16-18)\nlet vib_freq_x = vibExt[16] / 10;\nlet vib_freq_y = vibExt[17] / 10;\nlet vib_freq_z = vibExt[18] / 10;\n\n// Per-axis fault diagnosis codes, raw from the sensor  (offsets 19-21 =\n// D419-D421). Reported as-is: these are status/diagnosis codes, not a\n// measurement, so they are never scaled or averaged.\nlet fault_x = vibExt[19];\nlet fault_y = vibExt[20];\nlet fault_z = vibExt[21];\n\n// 6. Map Operational State Text Labels\nlet statusLabel = \"UNKNOWN\";\nswitch (statusCode) {\n    case 0: statusLabel = \"E-STOP\"; break;\n    case 1: statusLabel = \"STOPPED\"; break;\n    case 2: statusLabel = \"RUNNING\"; break;\n}\n\n// 7. Build Shared Identity Metadata\n// The machine this flow is polling. It MUST match the Machine ID\n// registered in the dashboard \u2014 that string is what links these\n// readings to the right machine everywhere downstream.\nlet machineId = \"motor01\";\nlet identityTags = { asset_id: machineId };\n\n// ==========================================\n// OUTPUT MESSAGE 1: Tailored for InfluxDB Out\n// ==========================================\nlet msgInflux = {\n    payload: [\n        {\n        vibration_x: safe(vbr_x),\n        vibration_y: safe(vbr_y),\n        vibration_z: safe(vbr_z),\n        temperature: safe(temperature),\n        current: safe(amp),\n        torque: safe(torque),\n        speed_command_hz: safe(speed_hz), // Safely drops to 0 on stop\n        frequency: frequency,\n        rpm: rpm,\n        voltage: safe(voltage),\n        power: safe(power),\n        status_code: statusCode,\n\n        // --- new extended vibration fields ---\n        accel_x: safe(accel_x),\n        accel_y: safe(accel_y),\n        accel_z: safe(accel_z),\n        sensor_chip_temp: safe(sensor_chip_temp),\n        disp_x: safe(disp_x),\n        disp_y: safe(disp_y),\n        disp_z: safe(disp_z),\n        vib_freq_x: safe(vib_freq_x),\n        vib_freq_y: safe(vib_freq_y),\n        vib_freq_z: safe(vib_freq_z),\n        fault_x: safe(fault_x),\n        fault_y: safe(fault_y),\n        fault_z: safe(fault_z)\n    },\n        { machine_id: machineId }\n    ]\n};\n\n// Clean out measurement property properties to keep Grafana rows clear\ndelete msgInflux.measurement;\n\n// ==========================================\n// OUTPUT MESSAGE 2: Tailored for Postgres Pipeline\n// ==========================================\nlet msgPostgres = {\n    payload: {\n        status_code: statusCode,\n        status_label: statusLabel\n    },\n    tags: identityTags\n};\n\nreturn [msgInflux, msgPostgres];\n",
         "outputs": 2,
         "timeout": "",
         "noerr": 0,
@@ -183,7 +183,8 @@
         "y": 260,
         "wires": [
             [
-                "1f6902732eed5a6d"
+                "1f6902732eed5a6d",
+                "c1a7f4e2b9d3016a"
             ],
             [
                 "812a42bd9fc1d123"
@@ -343,5 +344,92 @@
             "node-red-contrib-influxdb": "0.7.0",
             "node-red-contrib-postgresql": "0.15.4"
         }
+    },
+    {
+        "id": "c1a7f4e2b9d3016a",
+        "type": "function",
+        "z": "9d97c2693a2cda3c",
+        "name": "Build MQTT Payload (Guideline v1.0)",
+        "func": "// ---------------------------------------------------------------------------\n// Build the MQTT payload defined in the Node-RED MQTT Publishing Guideline\n// v1.0, section 6.1.\n//\n// Fed from the InfluxDB output of \"Map, Scale & Process Buffer\", so this branch\n// publishes without altering anything already working. That message carries\n// payload = [fields, tags]. A brand new message object is returned rather than\n// mutating msg, so the InfluxDB write on the same output is never affected.\n// ---------------------------------------------------------------------------\n\n// --- Identity (guideline sections 5 and 6.1) -------------------------------\nconst SITE_ID = \"SITE001\";\nconst DEVICE_TYPE = \"MOTOR\";\nconst DEVICE_ID = \"MOTOR001\";\n\n// --- Integer scaling -------------------------------------------------------\n// The guideline types every measurement as INTEGER, so each value is\n// multiplied by the factor below and rounded. Consumers divide by the same\n// factor to recover engineering units.\n//\n// The factors match the precision the sensor actually reports, which means the\n// transmitted integer is generally the raw Modbus register value again -\n// nothing is invented and nothing is lost. Acceleration is the exception: it\n// is derived from a +/-16 g full-scale word, so it is sent in milli-g.\nconst SCALE = {\n    motor_status: 1,             // state code 0/1/2\n    motor_frequency: 100,        //  49.97 Hz   -> 4997\n    motor_RPM: 10,               // 1452.4 rpm  -> 14524\n    motor_temperature: 1,        // whole degC from the PLC\n    invt_bus_volt: 1,\n    motor_volt: 1,               // whole volts from the PLC\n    motor_amp: 100,              //   4.48 A    -> 448\n    motor_power: 10,             //   2.2 kW    -> 22\n    motor_torque: 10,            //  14.3 %     -> 143\n    motor_VBR_chiptemp: 100,     //  31.5 degC  -> 3150\n    motor_VBR_V: 100,            //   1.24 mm/s -> 124\n    motor_VBR_A: 1000,           //   0.012 g   -> 12   (milli-g)\n    motor_VBR_D: 1,              // already whole micrometres\n    motor_VBR_F: 10,             //  24.6 Hz    -> 246\n    motor_VBR_fault: 1           // diagnosis code, never scaled\n};\n\n// Fields the current Modbus blocks do not read are published as null rather\n// than 0, so a consumer can tell \"not measured\" from \"measured as zero\".\nconst UNAVAILABLE = null;\n\nconst fields = Array.isArray(msg.payload) ? msg.payload[0] : msg.payload;\nif (!fields) { return null; }\n\n// \"2026-09-03 15:06:20\" - YYYY-MM-DD HH:mm:ss, per the section 6.1 spec.\nfunction formatDts(d) {\n    const p = (n) => String(n).padStart(2, \"0\");\n    return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate()) +\n        \" \" + p(d.getHours()) + \":\" + p(d.getMinutes()) + \":\" + p(d.getSeconds());\n}\n\nfunction scaled(v, factor) {\n    if (v === null || v === undefined || typeof v !== \"number\" || !isFinite(v)) {\n        return null;\n    }\n    return Math.round(v * factor);\n}\n\nconst body = {\n    site_id: SITE_ID,\n    device_type: DEVICE_TYPE,\n    device_id: DEVICE_ID,\n    dts: formatDts(new Date()),\n    data: {\n        motor_status: scaled(fields.status_code, SCALE.motor_status),\n        motor_frequency: scaled(fields.frequency, SCALE.motor_frequency),\n        motor_RPM: scaled(fields.rpm, SCALE.motor_RPM),\n        motor_temperature: scaled(fields.temperature, SCALE.motor_temperature),\n\n        // Not read by the current register blocks - needs the VFD DC bus\n        // voltage register adding to the Modbus reads.\n        invt_bus_volt: UNAVAILABLE,\n\n        motor_volt: scaled(fields.voltage, SCALE.motor_volt),\n        motor_amp: scaled(fields.current, SCALE.motor_amp),\n        motor_power: scaled(fields.power, SCALE.motor_power),\n        motor_torque: scaled(fields.torque, SCALE.motor_torque),\n        motor_VBR_chiptemp: scaled(fields.sensor_chip_temp, SCALE.motor_VBR_chiptemp),\n\n        motor_VBR_VX: scaled(fields.vibration_x, SCALE.motor_VBR_V),\n        motor_VBR_VY: scaled(fields.vibration_y, SCALE.motor_VBR_V),\n        motor_VBR_VZ: scaled(fields.vibration_z, SCALE.motor_VBR_V),\n\n        // D400-D402. These have historically read hard zero on this\n        // WTVB01-485 unit; the value is published as measured either way.\n        motor_VBR_AX: scaled(fields.accel_x, SCALE.motor_VBR_A),\n        motor_VBR_AY: scaled(fields.accel_y, SCALE.motor_VBR_A),\n        motor_VBR_AZ: scaled(fields.accel_z, SCALE.motor_VBR_A),\n\n        motor_VBR_DX: scaled(fields.disp_x, SCALE.motor_VBR_D),\n        motor_VBR_DY: scaled(fields.disp_y, SCALE.motor_VBR_D),\n        motor_VBR_DZ: scaled(fields.disp_z, SCALE.motor_VBR_D),\n\n        motor_VBR_FX: scaled(fields.vib_freq_x, SCALE.motor_VBR_F),\n        motor_VBR_FY: scaled(fields.vib_freq_y, SCALE.motor_VBR_F),\n        motor_VBR_FZ: scaled(fields.vib_freq_z, SCALE.motor_VBR_F),\n\n        // D419-D421, per-axis fault diagnosis codes.\n        motor_VBR_faultX: scaled(fields.fault_x, SCALE.motor_VBR_fault),\n        motor_VBR_faultY: scaled(fields.fault_y, SCALE.motor_VBR_fault),\n        motor_VBR_faultZ: scaled(fields.fault_z, SCALE.motor_VBR_fault)\n    }\n};\n\nreturn {\n    topic: \"pmm/\" + SITE_ID + \"/\" + DEVICE_ID,\n    payload: JSON.stringify(body),\n    qos: 1,\n    retain: false\n};\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1180,
+        "y": 180,
+        "wires": [
+            [
+                "e4b90d1c7a52f38b",
+                "b58e3a9c4f7d21e0"
+            ]
+        ]
+    },
+    {
+        "id": "e4b90d1c7a52f38b",
+        "type": "mqtt out",
+        "z": "9d97c2693a2cda3c",
+        "name": "Publish to Novaflow Broker",
+        "topic": "",
+        "qos": "1",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "a72c5f01d8e6b394",
+        "x": 1500,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "b58e3a9c4f7d21e0",
+        "type": "debug",
+        "z": "9d97c2693a2cda3c",
+        "name": "MQTT payload (inspect)",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1500,
+        "y": 120,
+        "wires": []
+    },
+    {
+        "id": "a72c5f01d8e6b394",
+        "type": "mqtt-broker",
+        "name": "Novaflow MQTT Broker",
+        "broker": "124.217.236.82",
+        "port": "1883",
+        "clientid": "novaflow-pdm-nodered-01",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
     }
 ]

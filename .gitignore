@@ -16,3 +16,6 @@ influxdb_explorer_data/
 
 # Local-only port/service tweaks; never committed (see .env.example)
 docker-compose.override.yml
+
+# Local flow snapshots taken before edits; git history is the real backup
+node-red-flows/backups/
