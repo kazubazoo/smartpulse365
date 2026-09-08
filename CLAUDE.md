@@ -204,6 +204,28 @@ is a separate question answered by `POST /api/connectivity/test`.
   exits on startup (`Unable to open config file`). Create the file — see
   "Setup on a fresh clone". MQTT is not on the acquisition path, so the rest of
   the stack runs fine meanwhile.
+- **The fleet query hits InfluxDB Core's Parquet file cap and the whole
+  dashboard goes `OFFLINE`.** `GET /api/machines` scans a 7-day window; Core
+  never compacts, so a 1 Hz feed crosses the default 432-file limit within a
+  day or two. The query then 500s, `run_query()`/the `except` clause turns that
+  into `[]`, and every machine renders offline with live data still arriving.
+  `INFLUXDB3_QUERY_FILE_LIMIT` (set to `20000` in `docker-compose.yml`) is the
+  stopgap; a retention period on `machine_telemetry` is the real fix. Symptom to
+  recognise: InfluxDB Explorer shows fresh rows but the dashboard shows nothing
+  connected.
+- **Containers default to UTC; the flow's `dts` and logs need local time.**
+  `TZ: "Asia/Kuala_Lumpur"` is set on `node-red`, `influxdb`, `api`, `grafana`
+  and `influxdb-explorer` in `docker-compose.yml`. InfluxDB still stores UTC
+  internally (correct) and the React app converts on display; the env var is
+  what stops the MQTT payload timestamp and Node-RED log lines being 8 hours
+  behind. `postgres` already had it.
+- **The acquisition flow writes ~3x per second, not once.** The
+  `Aggregate Modbus Registers` join re-emits on most incoming Modbus messages
+  rather than once per complete 4-block cycle, so InfluxDB and the MQTT branch
+  get duplicate rows/messages sharing a `dts` second. Harmless to correctness
+  (InfluxDB keeps them as distinct nanosecond rows) but it inflates the file
+  count above and multiplies MQTT traffic — fix the join when the flow is open
+  in the editor and node throughput is visible.
 - **`node-red-contrib-influxdb` ignores `msg.tags`.** Tags only reach InfluxDB
   when the payload is `[fields, tags]`. Setting `msg.tags` silently drops them.
 - **`{}` is truthy.** `/latest` returns `{}` when there is no data; guarding

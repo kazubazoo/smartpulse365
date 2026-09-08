@@ -31,6 +31,14 @@ services:
     container_name: influxdb
     user: "root"
     entrypoint: ["influxdb3", "serve", "--node-id=node0", "--object-store=file", "--data-dir=/var/lib/influxdb3/data"]
+    environment:
+      TZ: "Asia/Kuala_Lumpur"
+      # InfluxDB 3 Core does not compact Parquet files (that is Enterprise), so a
+      # 1 Hz feed piles them up. Once a query would scan more than this many
+      # files it returns 500 instead of results — and the API swallows that,
+      # leaving every machine stuck "OFFLINE" on the dashboard. Default is 432.
+      # Raise this, or set a shorter retention on the database, as data grows.
+      INFLUXDB3_QUERY_FILE_LIMIT: "20000"
     ports:
       - "${INFLUXDB_PORT:-8181}:8181"
     volumes:
@@ -42,6 +50,8 @@ services:
   influxdb-explorer:
     image: quay.io/influxdb/influxdb3-explorer:latest
     container_name: influxdb-explorer
+    environment:
+      TZ: "Asia/Kuala_Lumpur"
     ports:
       - "${INFLUXDB_EXPLORER_PORT:-8888}:80"
       - "${INFLUXDB_EXPLORER_API_PORT:-8889}:8888"
@@ -58,10 +68,15 @@ services:
       dockerfile: Dockerfile.node-red
     image: smartpulse365-node-red
     container_name: node-red
+    environment:
+      # The flow builds the MQTT payload's `dts` field and its log lines from
+      # the container's local time. Without this it runs UTC and every
+      # timestamp is 8 hours behind Malaysian wall-clock time.
+      TZ: "Asia/Kuala_Lumpur"
     ports:
       - "${NODE_RED_PORT:-1880}:1880"
     volumes:
-      - ./node_red_data:/data 
+      - ./node_red_data:/data
     depends_on:
       - mosquitto
       - postgres
@@ -81,6 +96,7 @@ services:
       INFLUXDB3_AUTH_TOKEN: ${INFLUXDB3_AUTH_TOKEN}
       # Land on the prototype dashboard instead of an empty home page
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/motor01-prototype.json
+      TZ: "Asia/Kuala_Lumpur"
     volumes:
       - ./grafana_data:/var/lib/grafana
       # Provisioned on every start, so a fresh clone gets the datasource and the
@@ -105,6 +121,7 @@ services:
       # machines stay visible when they stop reporting, shown as offline.
       MACHINES: ${MACHINES:-motor01:Motor 01}
       ONLINE_WINDOW_SECONDS: ${ONLINE_WINDOW_SECONDS:-30}
+      TZ: "Asia/Kuala_Lumpur"
     depends_on:
       - influxdb
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload

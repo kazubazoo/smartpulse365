@@ -274,7 +274,17 @@ InfluxDB write, following the *Node-RED MQTT Publishing Guideline v1.0*.
   **Build MQTT Payload** function node.
 - Broker host, port and client ID are in the flow; **username and password are
   not** — Node-RED keeps those in `flows_cred.json`, which is gitignored. Enter
-  them once in the editor after importing.
+  them once in the editor (broker node → Security tab) after importing. The
+  broker rejects the connection until they are set.
+- **The client ID must be unique on the broker.** It defaults to
+  `novaflow-pdm-nodered-01`. If anything else connects with the same ID — a
+  second Node-RED, an MQTT Explorer session with a fixed ID, another device —
+  the broker disconnects whichever connected first, and the two clients flap
+  in a ~15-second connect/disconnect loop. Give each connection its own ID.
+- For a self-contained bench, point the broker node at the local `mosquitto`
+  service (`mosquitto:1883`, anonymous) instead, and subscribe MQTT Explorer to
+  `localhost:1883` → `pmm/#`. The flow only publishes to the one broker its
+  broker node names, so MQTT Explorer must be pointed at that same broker.
 
 **All measurements are transmitted as scaled integers.** Each value is
 multiplied by its factor and rounded; consumers divide by the same factor. The
@@ -447,6 +457,27 @@ deployment. Node-RED stores its credentials unencrypted on this configuration.
 **The Modbus link is site-local.** If the application tier moves to the cloud,
 Node-RED stays on-premises and pushes to a cloud endpoint, or you need a VPN or
 edge gateway. That is the main topology decision for a hosted deployment.
+
+**One program can hold the PLC's Modbus TCP port at a time.** While the Node-RED
+flow is deployed it keeps a socket open to the PLC, and the Inovance
+programming software (AutoShop) then reports the PLC as *in use* and refuses to
+go online. Stop the flow first — `docker compose stop node-red`, or disable the
+Modbus client node and Deploy — then reconnect AutoShop; restart Node-RED when
+you are done programming.
+
+**Timezone.** Every service container runs `TZ=Asia/Kuala_Lumpur`
+(`docker-compose.yml`). InfluxDB still stores timestamps in UTC — as it must —
+and the React app converts them to Malaysian time on display. The env var is
+what keeps the MQTT payload's `dts` field and the Node-RED / Grafana clocks on
+local wall-clock time rather than 8 hours behind.
+
+**InfluxDB 3 Core does not compact.** A 1 Hz feed accumulates Parquet files
+until a query would scan more than `INFLUXDB3_QUERY_FILE_LIMIT` (raised to
+`20000` in `docker-compose.yml`, up from the 432 default) and starts returning
+500 — which surfaces as the dashboard showing every machine `OFFLINE` while
+InfluxDB Explorer still shows fresh data. Set a retention period on the
+`machine_telemetry` database, or move to InfluxDB 3 Enterprise (free for
+non-commercial use), for a permanent fix.
 
 **InfluxDB 3 Core uses SQL, not Flux.** Flux examples found online do not apply
 here. InfluxDB 2.x was considered for its built-in UI and rejected — the
