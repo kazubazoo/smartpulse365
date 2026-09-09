@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { supabase, authConfigured } from '../lib/supabase'
 import { useAuth } from './authStore'
-import { SettingsContext } from './settingsStore'
-import { DEFAULT_SETTINGS } from '../lib/defaults'
+import {
+  SettingsContext, SETTINGS_STORAGE_KEY as STORAGE_KEY, rememberLegacyMachineConfig,
+} from './settingsStore'
+import { DEFAULT_UI_SETTINGS, splitLegacySettings } from '../lib/defaults'
 
-const STORAGE_KEY = 'pdm.settings.v1'
 function readLocal() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return null
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) }
+    const { ui } = splitLegacySettings(JSON.parse(raw))
+    return ui
   } catch {
     return null
   }
@@ -25,15 +27,17 @@ function writeLocal(settings) {
 
 export function SettingsProvider({ children }) {
   const { user } = useAuth()
-  const [settings, setSettings] = useState(() => readLocal() ?? DEFAULT_SETTINGS)
+  const [settings, setSettings] = useState(() => readLocal() ?? DEFAULT_UI_SETTINGS)
   const [syncState, setSyncState] = useState('idle') // idle | saving | saved | error
-  const saveTimer = useRef(null)
   const loadedFor = useRef(null)
+  const savedTimer = useRef(null)
   // Mirror of the current settings for the update callbacks to read. Synced
   // after commit, which is soon enough — update() only ever runs from an event
   // handler, never during render.
   const settingsRef = useRef(settings)
   useEffect(() => { settingsRef.current = settings }, [settings])
+
+  useEffect(() => () => clearTimeout(savedTimer.current), [])
 
   // Pull the signed-in user's stored settings once per session. Local values
   // are kept if the row doesn't exist yet, and are then pushed up on first save.
@@ -52,35 +56,38 @@ export function SettingsProvider({ children }) {
           return
         }
         if (data?.settings) {
-          const merged = { ...DEFAULT_SETTINGS, ...data.settings }
-          setSettings(merged)
-          writeLocal(merged)
+          const { ui, machine } = splitLegacySettings(data.settings)
+          setSettings(ui)
+          writeLocal(ui)
+          rememberLegacyMachineConfig(machine)
         }
       })
   }, [user])
 
-  // Debounced write-behind: localStorage immediately, Supabase after a pause so
-  // dragging a threshold input doesn't fire a request per keystroke.
-  const persist = useCallback((next) => {
+  // Writes go out on an explicit action now — a picker change, or Save on the
+  // settings page — so there is nothing to debounce and the "Saved" tick is a
+  // truthful report of a completed round trip rather than a timer firing.
+  const persist = useCallback(async (next) => {
     writeLocal(next)
-    if (!authConfigured || !user) return
+    if (!authConfigured || !user) return { ok: true }
 
     setSyncState('saving')
-    clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(async () => {
-      const { error } = await supabase
-        .from('user_settings')
-        .upsert(
-          { user_id: user.id, settings: next, updated_at: new Date().toISOString() },
-          { onConflict: 'user_id' }
-        )
-      setSyncState(error ? 'error' : 'saved')
-      if (error) console.warn('Settings save failed:', error.message)
-      else setTimeout(() => setSyncState('idle'), 1500)
-    }, 600)
-  }, [user])
+    const { error } = await supabase
+      .from('user_settings')
+      .upsert(
+        { user_id: user.id, settings: next, updated_at: new Date().toISOString() },
+        { onConflict: 'user_id' }
+      )
 
-  useEffect(() => () => clearTimeout(saveTimer.current), [])
+    setSyncState(error ? 'error' : 'saved')
+    if (error) {
+      console.warn('Settings save failed:', error.message)
+      return { ok: false, error }
+    }
+    clearTimeout(savedTimer.current)
+    savedTimer.current = setTimeout(() => setSyncState('idle'), 2000)
+    return { ok: true }
+  }, [user])
 
   // The next value is derived from a ref rather than inside a setState updater:
   // persist() calls setSyncState, and React must not be told to update another
@@ -88,25 +95,17 @@ export function SettingsProvider({ children }) {
   const update = useCallback((patch) => {
     const next = { ...settingsRef.current, ...patch }
     setSettings(next)
-    persist(next)
-  }, [persist])
-
-  const updateGauge = useCallback((key, value) => {
-    const prev = settingsRef.current
-    const next = { ...prev, gauges: { ...prev.gauges, [key]: value } }
-    setSettings(next)
-    persist(next)
+    return persist(next)
   }, [persist])
 
   const reset = useCallback(() => {
-    setSettings(DEFAULT_SETTINGS)
-    persist(DEFAULT_SETTINGS)
+    setSettings(DEFAULT_UI_SETTINGS)
+    return persist(DEFAULT_UI_SETTINGS)
   }, [persist])
 
   return (
-    <SettingsContext.Provider value={{ settings, update, updateGauge, reset, syncState }}>
+    <SettingsContext.Provider value={{ settings, update, reset, syncState }}>
       {children}
     </SettingsContext.Provider>
   )
 }
-

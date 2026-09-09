@@ -9,10 +9,11 @@ import TimeRangePicker from '../components/TimeRangePicker'
 import { normalizeRow } from '../utils/time'
 import { apiFetch } from '../lib/api'
 import { useSettings } from '../contexts/settingsStore'
+import { useMachines } from '../contexts/machinesStore'
 import { rangeSeconds, refreshMs, toQuery, LIVE_TAIL_MAX_SECONDS } from '../lib/defaults'
 import {
   SET_VS_ACTUAL_FREQ, VIBRATION, DISPLACEMENT, FREQUENCY,
-  VHZ, LOAD, CURRENT_TORQUE, THERMAL,
+  VHZ, LOAD, CURRENT_TORQUE, THERMAL, FAULT_CODES,
 } from '../panels'
 
 const STATUS_MAP = { 0: 'E-STOP', 1: 'STOPPED', 2: 'RUNNING' }
@@ -20,6 +21,9 @@ const STATUS_COLOR = { 0: '#F87171', 1: '#38BDF8', 2: '#34D399' }
 
 function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
   const { settings } = useSettings()
+  // Alarm limits and analytic tuning come from the machine being viewed, not
+  // from the operator's preferences — see lib/standards.js.
+  const { configFor } = useMachines()
   const [history, setHistory] = useState([])
   const [latest, setLatest] = useState(null)
   const [health, setHealth] = useState(null)
@@ -34,9 +38,11 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
   const seconds = rangeSeconds(settings.rangeId)
   const interval = refreshMs(settings.refreshId)
   const liveTail = seconds <= LIVE_TAIL_MAX_SECONDS && interval > 0
-  const g = settings.gauges
 
-  const { vibWarn, vibCritical, vibScale, tempWarn, tempCritical } = settings
+  const config = configFor(machineId)
+  const g = config.gauges
+
+  const { vibWarn, vibCritical, vibScale, tempWarn, tempCritical } = config
   const thresholdQuery = useMemo(
     () => toQuery({
       vib_warn: vibWarn, vib_critical: vibCritical, vib_scale: vibScale,
@@ -132,8 +138,8 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
   useEffect(() => {
     if (!machineId) return
     const qs = toQuery({
-      seconds, sigma: settings.sigma,
-      lookback: settings.lookback, max_points: settings.maxPoints,
+      seconds, sigma: config.sigma,
+      lookback: config.lookback, max_points: settings.maxPoints,
     })
     const fetchAnomalies = () =>
       apiFetch(`/api/machines/${machineId}/anomalies?${qs}`)
@@ -143,7 +149,7 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
     if (interval <= 0) return
     const id = setInterval(fetchAnomalies, Math.max(interval, 2000))
     return () => clearInterval(id)
-  }, [machineId, seconds, settings.sigma, settings.lookback, settings.maxPoints, interval])
+  }, [machineId, seconds, config.sigma, config.lookback, settings.maxPoints, interval])
 
   useEffect(() => {
     if (!machineId) return
@@ -164,9 +170,9 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
 
   const anomalyCount = useMemo(
     () => anomalies.filter(
-      r => r.peak_vibration > r.upper_bound && r.peak_vibration > settings.anomalyFloor
+      r => r.peak_vibration > r.upper_bound && r.peak_vibration > config.anomalyFloor
     ).length,
-    [anomalies, settings.anomalyFloor]
+    [anomalies, config.anomalyFloor]
   )
 
   if (!machineId) {
@@ -253,7 +259,7 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
         <div className="md:col-span-2">
           <AnomalyChart
             data={anomalies}
-            floor={settings.anomalyFloor}
+            floor={config.anomalyFloor}
             maxPoints={settings.maxPoints}
             windowSeconds={seconds}
             domainFrom={windowEnd - seconds * 1000}
@@ -278,10 +284,24 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        <TimeSeriesChart title="Vibration Displacement (µm)" data={history} series={DISPLACEMENT} maxPoints={settings.maxPoints}
+        {/* "microns", not "µm": the title is uppercased in CSS, and
+            text-transform maps µ (U+00B5) to Greek capital Mu, so "µm" renders
+            as "MM" — the wrong unit by a factor of a thousand. */}
+        <TimeSeriesChart title="Vibration Displacement (microns)" data={history} series={DISPLACEMENT} maxPoints={settings.maxPoints}
           windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} showLegend />
         <TimeSeriesChart title="Dominant Frequency vs Shaft Speed (Hz)" data={history} series={FREQUENCY} maxPoints={settings.maxPoints}
           windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} showLegend />
+      </div>
+
+      <div className="mb-6">
+        <TimeSeriesChart
+          title="Per-Axis Fault Diagnosis Codes"
+          data={history}
+          series={FAULT_CODES}
+          maxPoints={settings.maxPoints}
+          windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd}
+          showLegend
+        />
       </div>
 
       <div className="mb-6">

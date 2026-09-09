@@ -16,3 +16,65 @@
 }
 
 body { background: var(--color-bg-deep); }
+
+/* The @import for the web fonts has to stay above every rule, so anything
+   hand-written lives below this line. */
+
+/* Range inputs have no cross-browser styling hook, so the track is painted
+   with a gradient driven by --pdm-pct, which the Slider component sets. */
+.pdm-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--pdm-accent, var(--color-accent-cyan)) 0%,
+    var(--pdm-accent, var(--color-accent-cyan)) var(--pdm-pct, 0%),
+    var(--color-border-glow) var(--pdm-pct, 0%),
+    var(--color-border-glow) 100%
+  );
+}
+
+.pdm-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--color-bg-panel);
+  border: 2px solid var(--pdm-accent, var(--color-accent-cyan));
+  cursor: grab;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.pdm-range::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--pdm-accent, var(--color-accent-cyan)) 20%, transparent);
+}
+
+.pdm-range:active::-webkit-slider-thumb { cursor: grabbing; }
+
+.pdm-range::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--color-bg-panel);
+  border: 2px solid var(--pdm-accent, var(--color-accent-cyan));
+  cursor: grab;
+}
+
+.pdm-range:focus-visible {
+  box-shadow: 0 0 0 2px var(--color-bg-deep), 0 0 0 4px var(--color-accent-cyan);
+}
+
+/* Spin buttons steal width from short numeric fields and invite mis-clicks on
+   values that matter; the slider is the coarse control instead. */
+.pdm-range + input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] { -moz-appearance: textfield; }

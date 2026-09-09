@@ -132,10 +132,31 @@ not a restart.
 
 **The backend is stateless.** Every threshold — vibration limits, temperature
 limits, anomaly sigma, lookback, health full-scale — arrives as a query
-parameter with a sensible default. The API stores no configuration. The
-frontend owns the values and persists them per user in Supabase. Two users can
-view the same machine under different alarm limits simultaneously. Do not add
+parameter with a sensible default. The API stores no configuration. Do not add
 server-side config state for these.
+
+**Settings are split by what they belong to.** Alarm limits and analytic tuning
+are properties of the *equipment* and live in `machines.thresholds` (Supabase),
+shared by everyone who views that machine — a 2 kW fan and a 300 kW compressor
+cannot share a vibration limit. Display preferences (time range, refresh,
+chart resolution, fault-table scope, idle timeout) are per operator and live in
+`user_settings`. The backend stays stateless either way: both halves are still
+sent as query parameters.
+
+`GET /api/machines` therefore takes a `limits` parameter — a compact
+`id:vib_warn:vib_critical:vib_scale:temp_warn:temp_critical` list, comma
+separated — so the fleet roll-up scores each machine against its own limits.
+Anything absent falls back to the query-level thresholds, which is what an
+older client sending nothing gets.
+
+**Vibration limits come from a standard, not from typed numbers.**
+`pdm-frontend/src/lib/standards.js` holds the published zone tables (ISO
+10816-1 classes I–IV, ISO 20816-3 / 10816-3 groups × rigid/flexible). A machine
+stores which standard and class it uses; `resolveLimits()` derives warning
+(B/C boundary) and critical (C/D boundary) from the table, so the numbers can
+never drift out of step with the class. Only `standardId: 'custom'` keeps
+hand-entered values. The shipped default is ISO 10816-1 Class I, which is where
+the original 1.8 / 4.5 mm/s defaults came from.
 
 **`machine_id` is the join key.** It is an InfluxDB tag written by the Node-RED
 flow, the primary key of the Supabase `machines` table, and the path segment in
@@ -175,6 +196,19 @@ their real amplitude at coarse zoom. Preserve that asymmetry.
 (`connectNulls={false}`) against an axis that spans the full selected window. In
 a vibration-monitoring system a fabricated zero reads as "measured and still"
 when the truth is "not measured" — that hides failed sensors.
+
+**Charts with alarm lines are scaled to the alarm, not to the data.** A chart
+auto-fitted to a quiet signal turns 0.05 mm/s of noise into a dramatic-looking
+trace, and operators read the shape of a trace long before they read the axis
+numbers. `TimeSeriesChart` therefore keeps the reference lines pulling the
+Y domain open (`ifOverflow="extendDomain"`) by default and offers an explicit
+Alarm/Fit toggle; fitted charts are marked "zoomed" with an amber axis so a
+close-up is never mistaken for a severe reading. Do not make Fit the default.
+
+**Fault diagnosis codes are codes, not measurements.** `fault_x/y/z` are
+bucketed with `MAX` (never `AVG` — the mean of code 0 and code 20 is code 10, a
+different fault) and drawn as `stepAfter` lines, so no value the sensor never
+emitted is ever drawn.
 
 **Online/offline is data recency, not reachability.** A machine is online when
 its newest row is within `ONLINE_WINDOW_SECONDS`. `run_state` separates
@@ -226,6 +260,39 @@ is a separate question answered by `POST /api/connectivity/test`.
   (InfluxDB keeps them as distinct nanosecond rows) but it inflates the file
   count above and multiplies MQTT traffic — fix the join when the flow is open
   in the editor and node throughput is visible.
+- **SQL aggregates return NaN, and `json.dumps` refuses it.** A windowed
+  `STDDEV` over its first row has one sample and is undefined; on a perfectly
+  flat signal — an idle motor reporting exactly 0.0 — the variance can also land
+  a hair below zero and come back NaN. `moving_avg + std_dev * sigma` is then
+  NaN and `/anomalies` 500s for a machine that is merely stopped, while a demo
+  machine with real variance passes. `_json_safe()` in `run_query()` turns every
+  non-finite float into `None` at the serialization boundary; the two routes
+  that call `client.query` directly scrub their rows the same way. Never fix
+  this by special-casing one query.
+- **`text-transform: uppercase` maps `µ` to Greek capital Mu.** Chart titles are
+  uppercased in CSS, so "Displacement (µm)" rendered as "(ΜM)" — indistinguishable
+  from millimetres, a unit error of 1000×. Spell micron units out in words in
+  any uppercased text.
+- **Postgres `jsonb` does not preserve key order.** A config saved to
+  `machines.thresholds` comes back with its keys rearranged (jsonb sorts by key
+  length, then bytewise), so `JSON.stringify(draft) !== JSON.stringify(stored)`
+  reported a difference after every successful save and the settings Save bar
+  never cleared. Compare with `stableStringify()` from `lib/defaults.js`, never
+  raw `JSON.stringify`, whenever one side has been through the database.
+- **Derived values must not be persisted.** `effectiveMachineConfig()` folds the
+  standard's limits (`vibWarn`, `vibCritical`, `zoneAB`, `source`) onto a config
+  for reading and for API calls. Writing that back stores values that are
+  recomputed on every read anyway, so a stale copy could outlive a change to the
+  zone table — and it was half of the stuck-Save-bar bug. `pickMachineConfig()`
+  reduces any config to exactly the storable shape; `saveMachineConfig()` runs
+  it on the way in and the settings form compares against
+  `storedConfigFor(id)`, not `configFor(id)`.
+- **Recharts prints whatever number it is given.** `vib_freq_x` is a register
+  divided by 10, which surfaces as `9.624999999999998` in a tooltip.
+  `tooltipValueFormatter` in `utils/chartConfig.js` caps at two decimals — well
+  beyond the sensors' resolution — and trims trailing zeros so a whole number
+  still reads as one. It is hoisted to module scope: a formatter allocated per
+  render would run on every mouse move across a chart.
 - **`node-red-contrib-influxdb` ignores `msg.tags`.** Tags only reach InfluxDB
   when the payload is `[fields, tags]`. Setting `msg.tags` silently drops them.
 - **`{}` is truthy.** `/latest` returns `{}` when there is no data; guarding
@@ -278,9 +345,22 @@ object, and the MQTT function returns a new message rather than mutating `msg`.
 
 - Context objects and their hooks live in `contexts/*Store.js`; the provider
   components live in `contexts/*Context.jsx`. Splitting them keeps React Fast
-  Refresh working — the lint rule enforces it.
+  Refresh working — the lint rule enforces it. Non-component helpers belong in
+  the `*Store.js` half too.
 - The ESLint config forbids synchronous `setState` inside an effect body.
-  Derive during render, or set state inside a promise callback.
+  Derive during render, set state inside a promise or timer callback, or reseed
+  a draft by remounting the form with a `key` — `SettingsPage` keys the machine
+  form on `machineId` for exactly this reason.
+- It also forbids impure calls during render, `Date.now()` included. Read clocks
+  in effects and handlers; a "just saved" acknowledgement is a state flag
+  cleared by a timer, never a timestamp compared against the clock in the body.
+- The location hash is the router: `#/<page>/<machineId>`. A reload therefore
+  lands where the operator was, Back works, and a view is worth pasting into a
+  message. There is no router dependency — see `useHashRoute` in `App.jsx`.
+- Inactivity sign-out lives in `hooks/useIdleLogout.js`. Only real user input
+  counts as activity; the dashboard's own 1 Hz polling deliberately does not, or
+  an unattended terminal would stay signed in forever. Activity is shared across
+  tabs through `localStorage`.
 - `panels.js` is declarative chart configuration. Adding a chart means adding an
   object there, not writing a component.
 

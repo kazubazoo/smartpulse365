@@ -46,3 +46,12 @@ export const THERMAL = [
   { name: 'MotorTemp', field: 'temperature', color: '#FB923C' },
   { name: 'SensorChipTemp', field: 'sensor_chip_temp', color: '#94A3B8', dash: '6 4', width: 1.5 },
 ]
+
+// Per-axis fault diagnosis codes reported by the WTVB01-485 (D419-D421).
+// These are codes, not measurements — a step from 0 to 20 is a state change,
+// not a rise — so the lines are drawn as steps and never interpolated.
+export const FAULT_CODES = [
+  { name: 'X', field: 'fault_x', color: '#38BDF8', step: true },
+  { name: 'Y', field: 'fault_y', color: '#34D399', step: true },
+  { name: 'Z', field: 'fault_z', color: '#FBBF24', step: true },
+]

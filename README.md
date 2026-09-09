@@ -2,8 +2,9 @@
 
 A self-contained condition-monitoring dashboard for industrial motors. It polls
 a PLC over Modbus TCP, stores the readings as time-series data, scores machine
-health against ISO 10816-3, and serves it all through a web dashboard with
-per-user alarm thresholds.
+health against the vibration standard each asset is configured for (ISO 10816-1,
+ISO 20816-3 / 10816-3, or custom limits), and serves it all through a web
+dashboard.
 
 Runs entirely on one machine with `docker compose up`. No cloud services are
 required — Supabase adds login and shared machine configuration when you want
@@ -32,9 +33,18 @@ Sigma, window length and noise floor are all editable from the dashboard.
 1 Hz; longer ones are aggregated server-side so a 24-hour view returns ~1,500
 points instead of 86,400. Axis labels adapt from seconds to weekday-and-date.
 
-**Everything is tunable from the UI.** Vibration and temperature limits, health
-scale, anomaly parameters, chart resolution and gauge ranges — stored per user,
-applied server-side.
+**Everything is tunable from the UI, at the right scope.** Settings are split in
+two. *Machine configuration* — vibration standard, alarm limits, temperature
+limits, anomaly tuning and gauge ranges — belongs to the asset and is shared by
+everyone who views it. *Display preferences* — time range, refresh rate, chart
+resolution, inactivity timeout — are yours alone. Both are applied server-side;
+the API still stores nothing.
+
+**Vibration limits come from a standard.** Choose ISO 10816-1 (classes I–IV) or
+ISO 20816-3 / 10816-3 (group and support), enter the machine's rated power,
+shaft height and mounting, and the dashboard suggests the class and derives the
+warning and critical limits straight from the published table. Equipment no
+table covers can use custom limits instead.
 
 **Machine management.** Add machines, set names, locations and connection
 details from the dashboard, and test whether a PLC is actually reachable before
@@ -70,7 +80,8 @@ committing the configuration.
 ```
 
 Supabase sits alongside, serving the browser directly for **authentication**,
-**per-user settings** and the **shared machine registry**.
+**per-user display preferences**, and the **shared machine registry** — which
+also carries each machine's vibration standard and alarm limits.
 
 ### Layer responsibilities
 
@@ -86,8 +97,9 @@ the database need not be publicly reachable — only the API does. Keep it that
 way if you deploy this.
 
 **The backend holds no configuration.** Thresholds arrive as query parameters
-with sensible defaults. Two operators can watch the same machine under different
-alarm limits at the same time.
+with sensible defaults. The dashboard owns the values: alarm limits and analytic
+tuning are stored against the *machine* (so every operator sees an asset scored
+the same way), display preferences against the *user*.
 
 **`machine_id` is the join key** between the Node-RED tag, the Supabase registry
 and the API route. All three must agree, or a machine shows no data.
@@ -332,11 +344,34 @@ writes the result tagged with `machine_id`.
 Adapting to different hardware means changing the register map in that one
 function node. Nothing downstream needs to know.
 
-### 3. Set your thresholds
+### 3. Set the machine's alarm limits
 
-The **Settings** page holds vibration and temperature limits, the anomaly
-detector's sigma and window, and gauge full-scale values. Set the gauge ranges
-to your motor's nameplate ratings so the arcs read meaningfully.
+**Settings → Machine configuration**, pick the machine, then:
+
+1. Enter the nameplate details — **rated power**, **shaft height** and how the
+   machine is **mounted**. Flexible mounts (anti-vibration feet, a light frame)
+   tolerate more movement than a rigid bolted baseplate.
+2. Choose the **standard** your site works to:
+
+   | Standard | Use it when |
+   |---|---|
+   | ISO 10816-1 | General classification by size and foundation. Sensible default for a single motor. |
+   | ISO 20816-3 | Current standard for industrial machines above 15 kW. Supersedes ISO 10816-3. |
+   | ISO 10816-3 | Same zone boundaries; kept for sites whose paperwork still cites the withdrawn number. |
+   | Custom | Equipment no published table covers, or an OEM specification. |
+
+3. The dashboard suggests the class from what you entered and explains why —
+   *"7.5 kW is a small machine (≤ 15 kW)"*. Accept it or override it. The
+   **warning** limit is the standard's B/C boundary and **critical** is C/D, read
+   straight from the table, so they cannot drift out of step with the class. The
+   severity bar shows where your machine's limits sit across zones A–D.
+4. Set the **anomaly detector** for this machine's own noise — a smooth
+   direct-drive fan tolerates a tighter sigma than a reciprocating compressor —
+   and the **gauge ranges** to its nameplate ratings.
+5. Press **Save changes**.
+
+These limits are shared: every operator sees this machine scored the same way.
+Your own **Display preferences** tab holds only what affects your screen.
 
 ### 4. Confirm it is live
 
@@ -355,7 +390,9 @@ Skip this to run unauthenticated on an isolated plant network.
 2. Run `supabase/schema.sql` in the SQL Editor (Dashboard → SQL Editor → New
    query). It creates `user_settings` and `machines` with Row Level Security
    policies restricting each account to its own settings, and seeds
-   `motor01`–`motor04`. Safe to re-run.
+   `motor01`–`motor04`. Safe to re-run — and you **must** re-run it after
+   updating, to add the `machines.thresholds` column that per-machine alarm
+   limits are stored in. The Settings page shows a banner until you do.
 3. From Project Settings → API copy the **Project URL** and an **anon key** —
    the long `eyJ…` JWT is the most broadly compatible — into **both** places
    (the values must match):
@@ -398,8 +435,10 @@ smartpulse365/
 │   └── src/
 │       ├── components/      Charts, cards, pickers
 │       ├── contexts/        Auth, settings, machines
+│       ├── hooks/           useIdleLogout — inactivity sign-out
 │       ├── pages/           Overview, Diagnostics, Machines, Settings, Profile
-│       ├── lib/             API client, Supabase client, defaults
+│       ├── lib/             API client, Supabase client, defaults, standards
+│       │   └── standards.js ISO 10816-1 / 20816-3 zone tables and class rules
 │       └── panels.js        Declarative chart configuration
 ├── grafana/                 Provisioned dashboard and datasources
 ├── postgres/init/           Schema applied on first database start
@@ -422,7 +461,7 @@ All routes are namespaced per machine. Thresholds are query parameters.
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | Liveness, and whether auth is enforced |
-| `GET /api/machines` | Fleet roll-up: state, health, anomaly counts |
+| `GET /api/machines` | Fleet roll-up: state, health, anomaly counts. `limits` carries each machine's own alarm limits as `id:warn:crit:scale:tempwarn:tempcrit`, comma separated, so a fan and a compressor are not scored on one scale |
 | `GET /api/machines/{id}/latest` | Most recent snapshot |
 | `GET /api/machines/{id}/history` | Time window, bucketed to a point budget |
 | `GET /api/machines/{id}/history/latest` | Delta fetch for live tailing |
@@ -445,6 +484,18 @@ The fields are kept in the payload deliberately so the gap stays visible.
 **Gaps are shown as gaps.** Missing telemetry is never backfilled with zeros. In
 a vibration-monitoring system a fabricated zero reads as "measured and still"
 when the truth is "not measured", which hides failed sensors.
+
+**Charts with alarm lines are scaled to the alarm, not to the data.** A quiet
+machine reading 0.05 mm/s against a 1.8 mm/s limit sits near the bottom of the
+chart, and that is the honest picture — auto-fitting the axis would turn its
+noise into a dramatic-looking trace. Use the **Fit** toggle in a chart's header
+to zoom into fine structure; the axis turns amber and the chart is marked
+*zoomed* so a close-up is never mistaken for a severe reading.
+
+**Signing out after inactivity.** Default 30 minutes, changeable under Display
+preferences, with a warning 60 seconds before. Only mouse, keyboard, touch and
+scroll count as activity — the dashboard's own polling deliberately does not, or
+an unattended terminal would never time out.
 
 **Online is data recency, not reachability.** A machine is online while its
 newest reading is younger than `ONLINE_WINDOW_SECONDS` (default 30). Use *Test

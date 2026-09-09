@@ -7,6 +7,17 @@ export const TOOLTIP_LABEL = { color: '#94A3B8' }
 export const LEGEND_WRAPPER = { fontSize: 11, color: '#94A3B8' }
 export const AXIS_STROKE = '#64748B'
 
+// Raw readings carry the full float — `vib_freq_x` is a register divided by 10,
+// which lands on 9.624999999999998 — and Recharts prints whatever it is given.
+// Two decimals is far beyond the sensors' actual resolution, so nothing real is
+// lost, and trailing zeros are trimmed so a whole number still reads as one
+// (RunningSpeed 15, not 15.00). Module scope: a formatter allocated per render
+// would run on every tooltip move.
+export function tooltipValueFormatter(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  return Number(value.toFixed(2))
+}
+
 // Each bucket contributes its actual minimum and maximum rows, so transient
 // spikes survive intact (important for bearing-defect impulses).
 export function decimate(rows, targetPoints, valueKey) {

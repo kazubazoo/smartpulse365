@@ -48,10 +48,24 @@ create table if not exists public.machines (
   -- Acquisition settings: protocol, host, port, unit id, poll interval,
   -- measurement name. Held as jsonb so fields can be added without a migration.
   source      jsonb not null default '{}'::jsonb,
+  -- Analytic configuration for THIS asset: which vibration standard applies,
+  -- the machine details that select the right class within it, the derived
+  -- alarm limits, anomaly-detector tuning and gauge full-scale values.
+  --
+  -- These live on the machine rather than on the operator because they are
+  -- properties of the equipment: a 200 kW compressor and a 2 kW fan do not
+  -- share an alarm limit, and the ISO class is decided by the machine's power
+  -- and mounting, not by who is looking at it. Display preferences stay in
+  -- user_settings. jsonb so new fields need no migration.
+  thresholds  jsonb not null default '{}'::jsonb,
   created_by  uuid references auth.users(id) on delete set null,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
+
+-- Existing deployments: add the column without touching any data.
+alter table public.machines
+  add column if not exists thresholds jsonb not null default '{}'::jsonb;
 
 alter table public.machines enable row level security;
 

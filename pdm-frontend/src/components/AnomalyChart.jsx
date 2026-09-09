@@ -5,7 +5,7 @@ import {
 } from 'recharts'
 import {
   GRID, AXIS_TICK, TOOLTIP_CONTENT, TOOLTIP_LABEL, LEGEND_WRAPPER,
-  AXIS_STROKE, decimate,
+  AXIS_STROKE, decimate, tooltipValueFormatter,
 } from '../utils/chartConfig'
 import { axisFormatter, tooltipFormatter, timeTicks } from '../utils/time'
 
@@ -51,6 +51,7 @@ function AnomalyChart({ data, floor, maxPoints = DEFAULT_MAX_POINTS,
             contentStyle={TOOLTIP_CONTENT}
             labelStyle={TOOLTIP_LABEL}
             labelFormatter={tooltipFormatter}
+            formatter={tooltipValueFormatter}
           />
           <Legend wrapperStyle={LEGEND_WRAPPER} />
           <Line type="monotone" dataKey="upper_bound" stroke="#7b7b83" strokeDasharray="4 4" strokeWidth={1} dot={false} isAnimationActive={false} connectNulls={false} />

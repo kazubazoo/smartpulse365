@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import socket
@@ -165,6 +166,11 @@ def require_user(authorization: Optional[str] = Header(default=None)):
 PEAK_FIELDS = [
     "vibration_x", "vibration_y", "vibration_z",
     "disp_x", "disp_y", "disp_z",
+    # Per-axis fault diagnosis codes from the sensor. Bucketed with MAX like
+    # the vibration peaks, never averaged: the mean of code 0 and code 20 is
+    # code 10, which is a different fault the sensor never reported. MAX keeps
+    # any fault raised inside the bucket visible at coarse zoom.
+    "fault_x", "fault_y", "fault_z",
 ]
 AVG_FIELDS = [
     "vib_freq_x", "vib_freq_y", "vib_freq_z",
@@ -260,13 +266,35 @@ def _is_missing_table(exc: Exception) -> bool:
     return "not found" in text and "motor_metrics" in text
 
 
+def _json_safe(value):
+    """Turn NaN and infinities into None, which JSON can carry.
+
+    SQL aggregates produce non-finite floats in ordinary situations: a windowed
+    STDDEV over a single row is undefined, and on a perfectly flat signal — an
+    idle motor reporting vibration of exactly 0.0 — the variance can land a
+    hair below zero in floating point and come back NaN. `json.dumps` refuses
+    both, so a machine that is merely stopped would 500 the whole endpoint.
+
+    None is the honest answer: it means "not computable here", and the charts
+    already render nulls as gaps rather than inventing a zero.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def run_query(query: str) -> list[dict]:
     try:
-        return client.query(query=query, language="sql").to_pylist()
+        rows = client.query(query=query, language="sql").to_pylist()
     except Exception as exc:
         if _is_missing_table(exc):
             return []
         raise HTTPException(status_code=502, detail=f"Telemetry query failed: {exc}")
+    return [_json_safe(row) for row in rows]
 
 
 @app.get("/api/health")
@@ -323,7 +351,7 @@ def _anomaly_counts(seconds: int, sigma: float, lookback: int, floor: float
     """
 
     try:
-        rows = client.query(query=query, language="sql").to_pylist()
+        rows = [_json_safe(r) for r in client.query(query=query, language="sql").to_pylist()]
     except Exception:
         return {}
 
@@ -335,12 +363,44 @@ def _anomaly_counts(seconds: int, sigma: float, lookback: int, floor: float
     }
 
 
+def _parse_per_machine_limits(raw: str) -> dict[str, Thresholds]:
+    """Per-machine alarm limits for the fleet roll-up.
+
+    Each machine carries its own vibration standard, so scoring the whole fleet
+    against one set of limits would rate a 2 kW fan and a 300 kW compressor on
+    the same scale. The dashboard sends a compact map keyed by machine id; any
+    machine missing from it falls back to the query-level thresholds, which is
+    also what an older client that sends nothing at all gets.
+
+    Format: `id:vib_warn:vib_critical:vib_scale:temp_warn:temp_critical`,
+    comma separated. Kept positional rather than JSON so the URL stays short at
+    fleet sizes and survives being logged.
+    """
+    out: dict[str, Thresholds] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        fields = part.split(":")
+        if len(fields) != 6 or not MACHINE_ID_RE.match(fields[0]):
+            continue
+        try:
+            values = [float(f) for f in fields[1:]]
+        except ValueError:
+            continue
+        if not all(math.isfinite(v) for v in values):
+            continue
+        out[fields[0]] = Thresholds(*values)
+    return out
+
+
 @app.get("/api/machines")
 def list_machines(
     ids: str = "",
     sigma: float = 3.0,
     lookback: int = 20,
     anomaly_floor: float = 0.5,
+    limits: str = "",
     t: Thresholds = Depends(thresholds),
     user=Depends(require_user),
 ):
@@ -349,7 +409,11 @@ def list_machines(
     `ids` lets the dashboard supply the machine list it holds (machines are
     managed in the UI and stored in Supabase). Without it the MACHINES
     environment variable is used, so the API still works standalone.
+
+    `limits` optionally carries each machine's own alarm limits — see
+    `_parse_per_machine_limits`. Anything not listed uses the query defaults.
     """
+    per_machine = _parse_per_machine_limits(limits)
     tagged = _has_machine_column()
 
     if tagged:
@@ -367,7 +431,7 @@ def list_machines(
         query = 'SELECT * FROM "motor_metrics" ORDER BY time DESC LIMIT 1'
 
     try:
-        rows = client.query(query=query, language="sql").to_pylist()
+        rows = [_json_safe(r) for r in client.query(query=query, language="sql").to_pylist()]
     except Exception:
         rows = []
 
@@ -427,7 +491,7 @@ def list_machines(
             except ValueError:
                 entry["online"] = False
 
-            health = compute_health(row, t)
+            health = compute_health(row, per_machine.get(mid, t))
             entry.update({
                 "status_code": row.get("status_code"),
                 "health_percent": health["health_percent"],
