@@ -366,6 +366,23 @@ object, and the MQTT function returns a new message rather than mutating `msg`.
 
 ## Security
 
+- **Self-registration is read from the project, never hardcoded.**
+  `fetchAuthSettings()` in `lib/supabase.js` reads `/auth/v1/settings` and
+  `AuthProvider` exposes `signUpEnabled` and `emailConfirmationRequired`. The
+  login screen shows its Create account tab only when the project allows
+  sign-ups, so toggling it in the Supabase dashboard takes effect on the next
+  page load with no rebuild. It fails **closed**: if the endpoint cannot be
+  reached, `signUpEnabled` is false.
+- **The sign-up form must not reveal who has an account.** With confirmations
+  on, Supabase answers an already-registered address with a success whose
+  `user.identities` is empty rather than admitting the account exists.
+  `LoginPage` detects that and shows the same "if it can be registered, a link
+  is on its way" wording as a genuine new registration. Do not replace it with
+  "that email is already taken".
+- With sign-ups enabled, any authenticated user can read the whole machine
+  registry and its telemetry — the RLS policies grant `select` to
+  `authenticated` unconditionally. Tighten `supabase/schema.sql` with a role
+  check before exposing the dashboard beyond a trusted network.
 - The Supabase anon/publishable key is public by design; access is enforced by
   Row Level Security policies in `supabase/schema.sql`, not by hiding it.
 - Never request or store the `service_role` key — it bypasses RLS.

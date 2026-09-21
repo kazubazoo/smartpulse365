@@ -400,9 +400,22 @@ Skip this to run unauthenticated on an isolated plant network.
    - `pdm-frontend/.env.local` as `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`
      (copy it from `pdm-frontend/.env.example`)
 4. Under Authentication → Sign In / Providers → Email, turn **Confirm email**
-   off for a bench setup and **Allow new users to sign up** off so accounts are
-   invite-only. Then create at least one operator under Authentication → Users —
-   there is no sign-up screen, so without a user you cannot log in.
+   off for a bench setup. Then decide how operators get accounts:
+
+   | **Allow new users to sign up** | What the login screen does |
+   |---|---|
+   | Off (default, recommended) | Sign-in only. Create each operator yourself under Authentication → Users. |
+   | On | A **Create account** tab appears beside Sign in, and anyone who can reach the dashboard can register. |
+
+   The login screen reads this setting from the project at load time, so
+   flipping it takes effect on the next page load — no rebuild. If it is off,
+   create at least one operator under Authentication → Users, or you cannot log
+   in at all.
+
+   With sign-ups **on**, anyone who can reach the URL can register and, once
+   signed in, read the whole machine registry and its telemetry — the Row Level
+   Security policies grant that to any authenticated user. That is reasonable on
+   an isolated plant network and is not if the dashboard is exposed more widely.
 5. `docker compose up -d api` (picks up the API-side vars) and rebuild the
    frontend (`npm run build && npm run preview`).
 
@@ -415,7 +428,8 @@ browser.
 
 Once configured, the dashboard requires login, the API rejects unauthenticated
 requests, and users get a Profile page with password change plus a
-forgot-password flow.
+forgot-password flow. Self-registration appears only when the project allows
+it, so an invite-only deployment never shows a tab that could only fail.
 
 ---
 
