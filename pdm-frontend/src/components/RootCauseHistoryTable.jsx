@@ -5,7 +5,7 @@ const FAULT_COLORS = {
   'Horizontal Unbalance': '#A78BFA',
 }
 
-function RootCauseHistoryTable({ rows }) {
+function RootCauseHistoryTable({ rows, vibWarn, tempWarn }) {
   return (
     <div className="bg-bg-panel border border-border-glow rounded-xl p-4 flex flex-col">
       <div className="flex items-center gap-2 mb-3">
@@ -13,7 +13,23 @@ function RootCauseHistoryTable({ rows }) {
         <span className="font-body text-xs tracking-widest uppercase text-slate-100">Root Cause History</span>
       </div>
       {rows.length === 0 ? (
-        <p className="text-slate-500 text-xs">No data</p>
+        // "No data" invited the reasonable question of why a visible wobble on
+        // the anomaly chart produced no entry here. This table lists readings
+        // that crossed an alarm limit; the anomaly chart flags excursions
+        // relative to the machine's own recent behaviour, which is a different
+        // and much more sensitive test. Saying what was checked, and against
+        // what, is the difference between "nothing wrong" and "not working".
+        <div className="text-xs text-slate-500">
+          <p>No reading crossed an alarm limit in this window.</p>
+          {(vibWarn != null || tempWarn != null) && (
+            <p className="mt-1 text-slate-600">
+              Checked against
+              {vibWarn != null && ` vibration ${vibWarn} mm/s`}
+              {vibWarn != null && tempWarn != null && ' and'}
+              {tempWarn != null && ` temperature ${tempWarn} °C`}.
+            </p>
+          )}
+        </div>
       ) : (
         <div className="overflow-y-auto max-h-40 flex flex-col gap-2">
           {rows.map((r, i) => (

@@ -13,7 +13,7 @@ const DEFAULT_MAX_POINTS = 1500
 
 function TimeSeriesChart({
   title, data, series, dualAxis = false, showLegend = false,
-  maxPoints = DEFAULT_MAX_POINTS, refLines,
+  maxPoints = DEFAULT_MAX_POINTS, refLines, note,
   windowSeconds, domainFrom, domainTo,
 }) {
   // Charts carrying alarm lines are scaled to the alarm by default, so a
@@ -155,6 +155,10 @@ function TimeSeriesChart({
           ))}
         </LineChart>
       </ResponsiveContainer>
+
+      {/* Used to state that a quantity is not available from this equipment, so
+          a missing trace is not read as a failed sensor. */}
+      {note && <p className="mt-2 text-[10px] text-slate-500">{note}</p>}
     </div>
   )
 }

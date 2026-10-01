@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import TimeSeriesChart from '../components/TimeSeriesChart'
+import FaultCodeTimeline from '../components/FaultCodeTimeline'
 import HealthScoreCard from '../components/HealthScoreCard'
 import AnomalyChart from '../components/AnomalyChart'
 import RootCauseHistoryTable from '../components/RootCauseHistoryTable'
@@ -12,7 +13,7 @@ import { useSettings } from '../contexts/settingsStore'
 import { useMachines } from '../contexts/machinesStore'
 import { rangeSeconds, refreshMs, toQuery, LIVE_TAIL_MAX_SECONDS } from '../lib/defaults'
 import {
-  SET_VS_ACTUAL_FREQ, VIBRATION, DISPLACEMENT, FREQUENCY,
+  ACTUAL_FREQ, VIBRATION, DISPLACEMENT, FREQUENCY,
   VHZ, LOAD, CURRENT_TORQUE, THERMAL, FAULT_CODES,
 } from '../panels'
 
@@ -246,7 +247,7 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
         {health && Object.keys(health).length > 0 && <HealthScoreCard health={health} />}
-        <RootCauseHistoryTable rows={rootCause} />
+        <RootCauseHistoryTable rows={rootCause} vibWarn={vibWarn} tempWarn={tempWarn} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -293,18 +294,17 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
           windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} showLegend />
       </div>
 
-      <div className="mb-6">
-        <TimeSeriesChart
+      {/* Paired: neither needs full width. The fault lanes are a short fixed
+          height, and temperature is a slow-moving trace, so side by side they
+          read as one "is anything wrong?" row. */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <FaultCodeTimeline
           title="Per-Axis Fault Diagnosis Codes"
           data={history}
           series={FAULT_CODES}
-          maxPoints={settings.maxPoints}
           windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd}
-          showLegend
+          note="Codes are reported per axis by the vibration sensor. A blank lane means no reading arrived, not that the axis was healthy."
         />
-      </div>
-
-      <div className="mb-6">
         <TimeSeriesChart
           title="Motor Temperature (°C)"
           data={history}
@@ -320,8 +320,9 @@ function DiagnosticsPage({ machines, machineId, onSelectMachine }) {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <TimeSeriesChart title="Set Frequency vs Actual Frequency" data={history} series={SET_VS_ACTUAL_FREQ} maxPoints={settings.maxPoints}
-          windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} showLegend />
+        <TimeSeriesChart title="Output Frequency (Hz)" data={history} series={ACTUAL_FREQ} maxPoints={settings.maxPoints}
+          windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} showLegend
+          note="Commanded set frequency is not published by this PLC, so only the measured output is shown." />
         <TimeSeriesChart title="Mechanical Load Analysis" data={history} series={LOAD} maxPoints={settings.maxPoints}
           windowSeconds={seconds} domainFrom={windowEnd - seconds * 1000} domainTo={windowEnd} dualAxis showLegend />
         <TimeSeriesChart title="V/Hz Efficiency Control" data={history} series={VHZ} maxPoints={settings.maxPoints}

@@ -1,6 +1,9 @@
-export const SET_VS_ACTUAL_FREQ = [
-  { name: 'SetFrequency', field: 'speed_command_hz', color: '#34D399' },
-  { name: 'ActualFrequency', field: 'frequency', color: '#FBBF24' },
+// Only the actual output frequency is plotted. The commanded frequency has no
+// field in the MQTT guideline payload, so it never arrives — and a legend entry
+// for a line that is always absent reads as a fault in the sensor rather than a
+// gap in the payload. The chart says so in a footnote instead.
+export const ACTUAL_FREQ = [
+  { name: 'OutputFrequency', field: 'frequency', color: '#FBBF24' },
 ]
 
 export const VIBRATION = [
@@ -48,10 +51,14 @@ export const THERMAL = [
 ]
 
 // Per-axis fault diagnosis codes reported by the WTVB01-485 (D419-D421).
-// These are codes, not measurements — a step from 0 to 20 is a state change,
-// not a rise — so the lines are drawn as steps and never interpolated.
+//
+// These are categorical codes, not magnitudes: code 20 is not "more" than code
+// 10, it is a different diagnosis. They are rendered by FaultCodeTimeline as one
+// lane per axis — no numeric axis to imply ordering, and no axis hidden beneath
+// another when two of them report the same code. Colour is assigned by the
+// component, so no `color` is set here.
 export const FAULT_CODES = [
-  { name: 'X', field: 'fault_x', color: '#38BDF8', step: true },
-  { name: 'Y', field: 'fault_y', color: '#34D399', step: true },
-  { name: 'Z', field: 'fault_z', color: '#FBBF24', step: true },
+  { name: 'X', field: 'fault_x' },
+  { name: 'Y', field: 'fault_y' },
+  { name: 'Z', field: 'fault_z' },
 ]
