@@ -2,6 +2,7 @@ import math
 import os
 import re
 import socket
+import statistics
 import struct
 import time as _time
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from typing import Optional
 import httpx
 from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from influxdb_client_3 import InfluxDBClient3
+from influxdb_client import InfluxDBClient
 
 app = FastAPI(title="Predictive Maintenance API")
 
@@ -27,11 +28,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = InfluxDBClient3(
-    host=os.environ.get("INFLUXDB_HOST", "http://influxdb:8181"),
-    token=os.environ.get("INFLUXDB3_AUTH_TOKEN"),
-    database=os.environ.get("INFLUXDB_DATABASE", "machine_telemetry"),
+# --------------------------------------------------------------------------
+# InfluxDB 2.x
+#
+# The telemetry store is an InfluxDB 2.x server, which speaks Flux — not the
+# SQL that InfluxDB 3 Core accepted. Three consequences shape every query
+# below, and none of them is optional:
+#
+#   * `range()` is mandatory. There is no equivalent of an unbounded
+#     `ORDER BY time DESC LIMIT 1`, so every route bounds itself, falling back
+#     to MAX_LOOKBACK where the caller asked for "all of it".
+#   * Results come back long — one row per field per timestamp — so every
+#     query ends in `pivot()` to rebuild the wide rows the dashboard expects.
+#   * There is no windowed STDDEV, no GREATEST and no CASE. Rolling statistics
+#     and fault classification are therefore computed in Python here, which
+#     also keeps the threshold values out of the query text entirely.
+# --------------------------------------------------------------------------
+INFLUX_URL = os.environ.get("INFLUX_URL", "http://influxdb:8086").rstrip("/")
+INFLUX_ORG = os.environ.get("INFLUX_ORG", "")
+INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "machine_telemetry")
+MEASUREMENT = os.environ.get("INFLUX_MEASUREMENT", "motor_metrics")
+
+# How far back a route reaches when the caller did not bound the window
+# itself: the fleet roll-up's "latest reading per machine", a single /latest,
+# and an unbounded fault table. Flux requires a range, so "everything" has to
+# become a number somewhere.
+MAX_LOOKBACK = os.environ.get("INFLUX_MAX_LOOKBACK", "7d")
+
+
+# --------------------------------------------------------------------------
+# Transport check
+#
+# The token authenticates every read, so sending it over plain HTTP to a host
+# across the internet hands it to anyone on the path — and it keeps doing so at
+# the dashboard's polling rate, not just once. Cleartext to a remote host is
+# therefore refused rather than merely discouraged.
+#
+# A single-label hostname (`influxdb`, `localhost`) cannot be a public name: it
+# is a container on the compose network or the loopback interface, so http is
+# allowed there and local development needs no special case. Set
+# INFLUX_ALLOW_INSECURE=true to override deliberately, which is a decision worth
+# having to write down.
+# --------------------------------------------------------------------------
+def _transport_warning(url: str) -> Optional[str]:
+    if url.startswith("https://"):
+        return None
+    host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    if host in {"localhost", "127.0.0.1", "::1"} or "." not in host:
+        return None
+    if os.environ.get("INFLUX_ALLOW_INSECURE", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    return (
+        f"Refusing to send the InfluxDB token in cleartext to '{host}'. "
+        "Use an https:// URL, or set INFLUX_ALLOW_INSECURE=true to override."
+    )
+
+
+INSECURE_TRANSPORT = _transport_warning(INFLUX_URL)
+
+_influx = InfluxDBClient(
+    url=INFLUX_URL,
+    token=os.environ.get("INFLUX_TOKEN", ""),
+    org=INFLUX_ORG,
+    timeout=30_000,
+    # Certificate verification stays on. Turning it off would accept any
+    # certificate and so give away the token to an interceptor while still
+    # looking encrypted.
+    verify_ssl=True,
 )
+_query_api = _influx.query_api()
 
 
 # --------------------------------------------------------------------------
@@ -66,27 +131,35 @@ CONFIGURED_MACHINES = _parse_machines()
 _schema_cache: dict[str, object] = {"checked_at": 0.0, "has_machine_id": False}
 
 
-def _has_machine_column() -> bool:
-    """Whether the telemetry table carries a machine_id tag yet.
+def _has_machine_tag() -> bool:
+    """Whether the telemetry measurement identifies the asset yet.
 
-    A single-motor deployment that has never written the tag has no such
-    column, and referencing it would fail the query outright — so every
-    machine filter is suppressed in that case and all data is treated as
-    belonging to the default machine.
+    A single-motor deployment that has never written the tag has no such tag
+    key, so every machine filter is suppressed in that case and all data is
+    treated as belonging to the default machine.
     """
+    if INSECURE_TRANSPORT:
+        return False
+
     now = _time.time()
     if now - float(_schema_cache["checked_at"]) < 60:
         return bool(_schema_cache["has_machine_id"])
 
+    flux = f'''
+import "influxdata/influxdb/schema"
+schema.measurementTagKeys(
+    bucket: "{INFLUX_BUCKET}",
+    measurement: "{MEASUREMENT}",
+    start: -{MAX_LOOKBACK},
+)
+'''
     try:
-        rows = client.query(
-            query=(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'motor_metrics' AND column_name = 'machine_id'"
-            ),
-            language="sql",
-        ).to_pylist()
-        _schema_cache["has_machine_id"] = len(rows) > 0
+        keys = {
+            rec.get_value()
+            for table in _query_api.query(flux, org=INFLUX_ORG)
+            for rec in table.records
+        }
+        _schema_cache["has_machine_id"] = MACHINE_TAG in keys
     except Exception:
         _schema_cache["has_machine_id"] = False
 
@@ -100,17 +173,23 @@ def validate_machine(machine_id: str) -> str:
     return machine_id
 
 
-def machine_clause(machine_id: str, prefix: str = "AND") -> str:
-    """SQL predicate restricting a query to one machine.
+def machine_filter(machine_id: str) -> str:
+    """Flux filter restricting a stream to one machine.
 
-    Rows written before the tag existed have a NULL machine_id; they are
-    attributed to the default machine so historical data is not orphaned.
+    Rows written before the tag existed carry no identifying tag at all.
+    InfluxDB matches a series missing a tag against the empty string, so `== ""`
+    is how those untagged rows are attributed to the default machine rather than
+    orphaned — the Flux equivalent of the old `machine_id IS NULL`.
+
+    Returns an empty string when nothing has ever written the tag, since
+    filtering on a tag key that does not exist would match nothing at all.
     """
-    if not _has_machine_column():
+    if not _has_machine_tag():
         return ""
     if machine_id == DEFAULT_MACHINE:
-        return f" {prefix} (machine_id = '{machine_id}' OR machine_id IS NULL)"
-    return f" {prefix} machine_id = '{machine_id}'"
+        return (f'  |> filter(fn: (r) => r["{MACHINE_TAG}"] == "{machine_id}" '
+                f'or r["{MACHINE_TAG}"] == "")\n')
+    return f'  |> filter(fn: (r) => r["{MACHINE_TAG}"] == "{machine_id}")\n'
 
 
 # --------------------------------------------------------------------------
@@ -179,7 +258,113 @@ AVG_FIELDS = [
     "power", "current", "torque", "temperature", "sensor_chip_temp",
 ]
 ALL_FIELDS = PEAK_FIELDS + AVG_FIELDS
-FIELD_LIST = ", ".join(ALL_FIELDS)
+
+
+# --------------------------------------------------------------------------
+# Cloud schema translation
+#
+# The cloud bucket is filled by Novaflow's ingest from the MQTT payload that
+# *Build MQTT Payload* publishes, so it carries the MQTT Publishing Guideline's
+# schema rather than this dashboard's: guideline field names, and every value a
+# **scaled integer** because the guideline types all measurements as INTEGER.
+#
+# Each entry below is `dashboard_field: (source_field, divisor)`, and the
+# divisors are the same factors the flow multiplied by — the two tables have to
+# be changed together. Getting one wrong is not a cosmetic bug: reading
+# motor_VBR_VX's 124 as 124 mm/s instead of 1.24 mm/s puts a healthy motor three
+# zones above its critical limit and alarms permanently.
+#
+# Dividing after aggregation is safe: scaling is linear, so it commutes with
+# both MAX and MEAN.
+# --------------------------------------------------------------------------
+GUIDELINE_FIELDS = {
+    "status_code":      ("motor_status", 1),
+    "frequency":        ("motor_frequency", 100),
+    "rpm":              ("motor_RPM", 10),
+    "temperature":      ("motor_temperature", 1),
+    "voltage":          ("motor_volt", 1),
+    "current":          ("motor_amp", 100),
+    "power":            ("motor_power", 10),
+    "torque":           ("motor_torque", 10),
+    "sensor_chip_temp": ("motor_VBR_chiptemp", 100),
+
+    "vibration_x":      ("motor_VBR_VX", 100),
+    "vibration_y":      ("motor_VBR_VY", 100),
+    "vibration_z":      ("motor_VBR_VZ", 100),
+
+    # Published in milli-g, because the guideline needs an integer and the
+    # sensor's full scale is +/-16 g. Divided back to g here.
+    "accel_x":          ("motor_VBR_AX", 1000),
+    "accel_y":          ("motor_VBR_AY", 1000),
+    "accel_z":          ("motor_VBR_AZ", 1000),
+
+    # Already whole micrometres on the wire.
+    "disp_x":           ("motor_VBR_DX", 1),
+    "disp_y":           ("motor_VBR_DY", 1),
+    "disp_z":           ("motor_VBR_DZ", 1),
+
+    "vib_freq_x":       ("motor_VBR_FX", 10),
+    "vib_freq_y":       ("motor_VBR_FY", 10),
+    "vib_freq_z":       ("motor_VBR_FZ", 10),
+
+    # Diagnosis codes, never scaled — and so never divided.
+    "fault_x":          ("motor_VBR_faultX", 1),
+    "fault_y":          ("motor_VBR_faultY", 1),
+    "fault_z":          ("motor_VBR_faultZ", 1),
+
+    # `speed_command_hz` is deliberately absent: the guideline payload has no
+    # field for the VFD's commanded frequency, so it cannot be read from the
+    # cloud at all. The Set Frequency panel renders an empty chart rather than
+    # a fabricated trace, which is the honest result — adding the field to the
+    # MQTT payload is what would fix it.
+}
+
+# "guideline" for the cloud bucket; "native" to read a store written directly
+# by the flow's InfluxDB node, where the names and units are already correct.
+GUIDELINE_SCHEMA = os.environ.get("INFLUX_SCHEMA", "guideline").lower() == "guideline"
+
+# The guideline payload identifies the asset as `device_id` (and the flow sends
+# "MOTOR001"), where the native schema tags rows `machine_id`. Whichever it is,
+# rows come out of here keyed on `machine_id`, so nothing downstream has to care
+# — but the id itself must still match the machine registry, or the join fails
+# and the machine shows no data.
+MACHINE_TAG = os.environ.get(
+    "INFLUX_MACHINE_TAG", "device_id" if GUIDELINE_SCHEMA else "machine_id"
+)
+
+_SOURCE_OF = {name: src for name, (src, _) in GUIDELINE_FIELDS.items()}
+_FROM_SOURCE = {src: (name, div) for name, (src, div) in GUIDELINE_FIELDS.items()}
+
+
+def _source_limit(field: str, value: float) -> float:
+    """Express a dashboard-unit limit in the units the bucket actually stores.
+
+    A comparison pushed into Flux runs against the stored value, which under the
+    guideline schema is scaled — so a 1.8 mm/s limit has to become 180 before it
+    means anything there. Comparing the raw stored integer against 1.8 would
+    flag every reading above 0.018 mm/s, i.e. all of them.
+    """
+    if not GUIDELINE_SCHEMA or field not in GUIDELINE_FIELDS:
+        return value
+    return value * GUIDELINE_FIELDS[field][1]
+
+
+def _source_name(field: str) -> str:
+    if not GUIDELINE_SCHEMA:
+        return field
+    return _SOURCE_OF.get(field, field)
+
+
+def _source_fields(fields: list[str]) -> list[str]:
+    """Translate dashboard field names into the names the bucket actually holds.
+
+    A field with no counterpart in the guideline payload is dropped rather than
+    passed through: asking for it would filter on a field key that does not
+    exist, which quietly matches nothing.
+    """
+    if not GUIDELINE_SCHEMA:
+        return fields
+    return [_SOURCE_OF[f] for f in fields if f in _SOURCE_OF]
 
 
 class Thresholds:
@@ -255,17 +440,6 @@ def compute_health(row, t: Thresholds):
     }
 
 
-def _is_missing_table(exc: Exception) -> bool:
-    """A telemetry table only springs into existence on the first write.
-
-    Before any machine has reported, querying it is a legitimate empty result,
-    not a server error — so the dashboard must render an empty state rather
-    than an error banner on a fresh install.
-    """
-    text = str(exc).lower()
-    return "not found" in text and "motor_metrics" in text
-
-
 def _json_safe(value):
     """Turn NaN and infinities into None, which JSON can carry.
 
@@ -287,19 +461,155 @@ def _json_safe(value):
     return value
 
 
-def run_query(query: str) -> list[dict]:
+# Flux bookkeeping columns. `_measurement` and the tag columns are dropped on
+# the way out because the dashboard's row shape never carried them; machine_id
+# is kept, since the fleet roll-up keys on it.
+_DROP_COLUMNS = {"result", "table", "_start", "_stop", "_measurement"}
+
+
+def _iso(stamp) -> str:
+    """Render a Flux timestamp the way the dashboard expects to read it.
+
+    `toEpoch()` in the frontend appends a `Z` to any timestamp that lacks one
+    and hands the result to `new Date()`. A string carrying an explicit
+    `+00:00` offset would become `...+00:00Z` — an invalid date, and NaN all
+    the way into the charts. So the offset is normalised to a literal `Z`
+    here rather than left to `isoformat()`'s default.
+
+    Microsecond precision is kept deliberately: the acquisition flow writes
+    several times per second, and the live tail de-duplicates rows by this
+    exact string. Truncating to milliseconds would collide and drop readings.
+    """
+    if isinstance(stamp, datetime):
+        return (stamp.astimezone(timezone.utc)
+                     .isoformat(timespec="microseconds")
+                     .replace("+00:00", "Z"))
+    return str(stamp)
+
+
+def _row(values: dict) -> dict:
+    """Rebuild one dashboard row: rename, un-scale, normalise the timestamp."""
+    out = {}
+    for key, value in values.items():
+        if key in _DROP_COLUMNS:
+            continue
+        if key == "_time":
+            out["time"] = _iso(value)
+            continue
+        if key == MACHINE_TAG:
+            out["machine_id"] = value
+            continue
+
+        name, divisor = _FROM_SOURCE.get(key, (key, 1)) if GUIDELINE_SCHEMA \
+            else (key, 1)
+        if divisor != 1 and isinstance(value, (int, float)) \
+                and not isinstance(value, bool):
+            value = value / divisor
+        out[name] = _json_safe(value)
+    return out
+
+
+def run_flux(flux: str) -> list[dict]:
+    """Execute a Flux query and return wide rows.
+
+    A measurement that has never been written is an empty result in InfluxDB
+    2.x rather than an error, so a fresh install renders an empty state with no
+    special handling. A bucket or token that is wrong, by contrast, does raise
+    — and is reported rather than swallowed, because a configuration mistake
+    that silently returns no rows shows every machine as OFFLINE while live
+    data is arriving.
+    """
+    if INSECURE_TRANSPORT:
+        raise HTTPException(status_code=503, detail=INSECURE_TRANSPORT)
     try:
-        rows = client.query(query=query, language="sql").to_pylist()
+        tables = _query_api.query(flux, org=INFLUX_ORG)
     except Exception as exc:
-        if _is_missing_table(exc):
-            return []
         raise HTTPException(status_code=502, detail=f"Telemetry query failed: {exc}")
-    return [_json_safe(row) for row in rows]
+    return [_row(rec.values) for table in tables for rec in table.records]
+
+
+def _field_filter(fields: list[str]) -> str:
+    names = ", ".join(f'"{f}"' for f in _source_fields(fields))
+    return f'  |> filter(fn: (r) => contains(value: r._field, set: [{names}]))\n'
+
+
+def _stream(start: str, machine_id: Optional[str] = None,
+            fields: Optional[list[str]] = None) -> str:
+    """The opening of every query: bucket, range, measurement, machine, fields."""
+    flux = (f'from(bucket: "{INFLUX_BUCKET}")\n'
+            f'  |> range(start: {start})\n'
+            f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")\n')
+    if fields:
+        flux += _field_filter(fields)
+    if machine_id is not None:
+        flux += machine_filter(machine_id)
+    return flux
+
+
+_PIVOT = '  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")\n'
+
+
+def _rolling_bounds(rows: list[dict], sigma: float, lookback: int) -> list[dict]:
+    """Trailing mean and standard deviation of peak vibration, per row.
+
+    InfluxDB 2.x has no windowed STDDEV, so the moving band that the old SQL
+    computed with `STDDEV(...) OVER (ROWS BETWEEN n PRECEDING AND CURRENT ROW)`
+    is computed here over the same trailing window.
+
+    The first row of a window has a single sample, which makes the sample
+    standard deviation undefined; an idle motor reporting a perfectly flat
+    0.0 makes it zero. Both come back as a null bound rather than a number —
+    the charts draw nulls as gaps, and inventing a band around a signal we
+    cannot characterise would be fabricated confidence.
+    """
+    out = []
+    peaks: list[float] = []
+    for row in rows:
+        peak = row.get("peak_vibration")
+        entry = {"time": row["time"], "peak_vibration": peak,
+                 "moving_avg": None, "upper_bound": None, "lower_bound": None}
+        if peak is None:
+            out.append(entry)
+            continue
+
+        peaks.append(peak)
+        window = peaks[-(lookback + 1):]
+        mean = statistics.fmean(window)
+        entry["moving_avg"] = mean
+        if len(window) >= 2:
+            dev = statistics.stdev(window)
+            entry["upper_bound"] = mean + dev * sigma
+            entry["lower_bound"] = mean - dev * sigma
+        out.append(entry)
+    return [_json_safe(r) for r in out]
+
+
+_VIB_AXES = ["vibration_x", "vibration_y", "vibration_z"]
+
+
+def _peak_rows(rows: list[dict]) -> list[dict]:
+    """Collapse the three vibration axes into the peak, as GREATEST() did.
+
+    A row where no axis reported at all yields None, not 0.0 — a fabricated
+    zero reads as "measured and still" when the truth is "not measured".
+    """
+    out = []
+    for row in rows:
+        values = [row[a] for a in _VIB_AXES if row.get(a) is not None]
+        out.append({"time": row["time"],
+                    "peak_vibration": max(values) if values else None})
+    return out
 
 
 @app.get("/api/health")
 def service_health():
-    return {"status": "ok", "auth_enabled": AUTH_ENABLED}
+    return {
+        "status": "ok",
+        "auth_enabled": AUTH_ENABLED,
+        # Surfaced so a deployment that cannot read telemetry says why, rather
+        # than every machine simply appearing offline.
+        "telemetry_blocked": INSECURE_TRANSPORT,
+    }
 
 
 ANOMALY_WINDOW_SECONDS = int(os.environ.get("ANOMALY_WINDOW_SECONDS", "3600"))
@@ -318,48 +628,43 @@ def _run_state(online: bool, status_code) -> str:
     return {0: "E-STOP", 1: "IDLE", 2: "RUNNING"}.get(code, "UNKNOWN")
 
 
+def _count_exceedances(rows: list[dict], sigma: float, lookback: int,
+                       floor: float) -> int:
+    return sum(
+        1 for r in _rolling_bounds(_peak_rows(rows), sigma, lookback)
+        if r["peak_vibration"] is not None and r["upper_bound"] is not None
+        and r["peak_vibration"] > r["upper_bound"]
+        and r["peak_vibration"] > floor
+    )
+
+
 def _anomaly_counts(seconds: int, sigma: float, lookback: int, floor: float
                     ) -> dict[str, int]:
-    """Anomalies per machine over the recent window, for the fleet cards."""
-    tagged = _has_machine_column()
-    partition = "PARTITION BY machine_id " if tagged else ""
-    select_id = "machine_id, " if tagged else ""
-    group_by = "GROUP BY machine_id" if tagged else ""
+    """Anomalies per machine over the recent window, for the fleet cards.
 
-    query = f"""
-        SELECT {select_id}COUNT(*) AS anomalies
-        FROM (
-            SELECT {select_id}peak_vibration,
-                   moving_avg + (std_dev * {sigma}) AS upper_bound
-            FROM (
-                SELECT {select_id}time,
-                       GREATEST(vibration_x, vibration_y, vibration_z) AS peak_vibration,
-                       AVG(GREATEST(vibration_x, vibration_y, vibration_z)) OVER (
-                           {partition}ORDER BY time
-                           ROWS BETWEEN {lookback} PRECEDING AND CURRENT ROW
-                       ) AS moving_avg,
-                       STDDEV(GREATEST(vibration_x, vibration_y, vibration_z)) OVER (
-                           {partition}ORDER BY time
-                           ROWS BETWEEN {lookback} PRECEDING AND CURRENT ROW
-                       ) AS std_dev
-                FROM "motor_metrics"
-                WHERE time >= now() - INTERVAL '{seconds} seconds'
-            ) AS stats
-        ) AS flagged
-        WHERE peak_vibration > upper_bound AND peak_vibration > {floor}
-        {group_by}
+    Reduced to one-second peaks before the trailing statistics are taken. The
+    acquisition flow emits several rows per second, so a row-based lookback
+    over raw rows would span only a fraction of the seconds the operator asked
+    for, and the count would drift with the write rate rather than with the
+    machine. One second per sample makes `lookback` mean what it reads like.
     """
+    flux = _stream(f"-{seconds}s", fields=_VIB_AXES)
+    flux += '  |> aggregateWindow(every: 1s, fn: max, createEmpty: false, timeSrc: "_start")\n'
+    flux += _PIVOT
+    flux += '  |> sort(columns: ["_time"])\n'
 
     try:
-        rows = [_json_safe(r) for r in client.query(query=query, language="sql").to_pylist()]
-    except Exception:
+        rows = run_flux(flux)
+    except HTTPException:
         return {}
 
-    if not tagged:
-        return {DEFAULT_MACHINE: rows[0]["anomalies"] if rows else 0}
+    by_machine: dict[str, list[dict]] = {}
+    for row in rows:
+        by_machine.setdefault(row.get("machine_id") or DEFAULT_MACHINE, []).append(row)
+
     return {
-        (r.get("machine_id") or DEFAULT_MACHINE): r["anomalies"]
-        for r in rows
+        mid: _count_exceedances(machine_rows, sigma, lookback, floor)
+        for mid, machine_rows in by_machine.items()
     }
 
 
@@ -414,26 +719,11 @@ def list_machines(
     `_parse_per_machine_limits`. Anything not listed uses the query defaults.
     """
     per_machine = _parse_per_machine_limits(limits)
-    tagged = _has_machine_column()
 
-    if tagged:
-        query = """
-            SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY machine_id ORDER BY time DESC
-                ) AS rn
-                FROM "motor_metrics"
-                WHERE time >= now() - INTERVAL '7 days'
-            ) AS ranked
-            WHERE rn = 1
-        """
-    else:
-        query = 'SELECT * FROM "motor_metrics" ORDER BY time DESC LIMIT 1'
-
-    try:
-        rows = [_json_safe(r) for r in client.query(query=query, language="sql").to_pylist()]
-    except Exception:
-        rows = []
+    # `last()` is pushed down into storage, so this stays cheap however much
+    # history the bucket holds — which is what the old ROW_NUMBER() window over
+    # a seven-day scan was not.
+    rows = run_flux(_stream(f"-{MAX_LOOKBACK}") + '  |> last()\n' + _PIVOT)
 
     # Untagged rows partition separately but belong to the default machine —
     # keep whichever of the two is newer.
@@ -508,16 +798,25 @@ def list_machines(
     return out
 
 
+def _latest_row(machine_id: str) -> dict:
+    """The newest reading for one machine, as a single wide row.
+
+    `last()` runs per field, so a field that stopped reporting earlier than the
+    rest comes back carrying its own older timestamp and pivots into a second
+    row. Only the newest row is returned: a value from minutes ago is not part
+    of "the latest reading", and reporting it as such would age-launder stale
+    data into a live gauge.
+    """
+    rows = run_flux(_stream(f"-{MAX_LOOKBACK}", machine_id) + '  |> last()\n' + _PIVOT)
+    if not rows:
+        return {}
+    return max(rows, key=lambda r: r["time"])
+
+
 @app.get("/api/machines/{machine_id}/latest")
 def latest(machine_id: str, user=Depends(require_user)):
     validate_machine(machine_id)
-    query = f"""
-        SELECT * FROM "motor_metrics"
-        WHERE 1=1{machine_clause(machine_id)}
-        ORDER BY time DESC LIMIT 1
-    """
-    rows = run_query(query)
-    return rows[0] if rows else {}
+    return _latest_row(machine_id)
 
 
 @app.get("/api/machines/{machine_id}/history")
@@ -526,54 +825,68 @@ def history(machine_id: str, seconds: int = 300, max_points: int = 1500,
     validate_machine(machine_id)
     seconds = max(1, min(seconds, 7 * 24 * 3600))
     bucket = _bucket_seconds(seconds, max_points)
-    where = f"time >= now() - INTERVAL '{seconds} seconds'{machine_clause(machine_id)}"
 
     if bucket == 0:
-        query = f"""
-            SELECT time, {FIELD_LIST}
-            FROM "motor_metrics"
-            WHERE {where}
-            ORDER BY time ASC
-        """
+        flux = (_stream(f"-{seconds}s", machine_id, ALL_FIELDS)
+                + _PIVOT + '  |> sort(columns: ["_time"])\n')
     else:
-        aggs = [f"MAX({f}) AS {f}" for f in PEAK_FIELDS]
-        aggs += [f"AVG({f}) AS {f}" for f in AVG_FIELDS]
-        query = f"""
-            SELECT date_bin(INTERVAL '{bucket} seconds', time) AS time,
-                   {', '.join(aggs)}
-            FROM "motor_metrics"
-            WHERE {where}
-            GROUP BY 1
-            ORDER BY 1 ASC
-        """
+        # The two field sets are aggregated differently and then unioned, which
+        # is how the MAX-the-peaks / MEAN-the-rest asymmetry survives in Flux.
+        # A transient impulse keeps its real amplitude at coarse zoom, and a
+        # fault code is never averaged into a code the sensor never emitted.
+        #
+        # createEmpty: false leaves a window with no readings out of the result
+        # entirely, so a gap in the telemetry stays a gap in the chart instead
+        # of becoming a fabricated zero.
+        #
+        # timeSrc: "_start" stamps each window with its beginning, which is
+        # what date_bin() did. The Flux default is the window's end, and taking
+        # it would shift every point one bucket into the future.
+        base = _stream(f"-{seconds}s", machine_id)
+        peaks = (base + _field_filter(PEAK_FIELDS)
+                 + f'  |> aggregateWindow(every: {bucket}s, fn: max, '
+                   'createEmpty: false, timeSrc: "_start")\n')
+        means = (base + _field_filter(AVG_FIELDS)
+                 + f'  |> aggregateWindow(every: {bucket}s, fn: mean, '
+                   'createEmpty: false, timeSrc: "_start")\n')
+        flux = (f'peaks = {peaks}\nmeans = {means}\n'
+                'union(tables: [peaks, means])\n'
+                + _PIVOT + '  |> sort(columns: ["_time"])\n')
 
-    return {"bucket_seconds": bucket, "rows": run_query(query)}
+    return {"bucket_seconds": bucket, "rows": run_flux(flux)}
+
+
+# The live tail's cursor is a timestamp this API emitted, echoed back. It is
+# validated rather than escaped: it lands inside a Flux expression, and the only
+# safe way to interpolate a caller-supplied value there is to prove it is a
+# timestamp first.
+RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$"
+)
 
 
 @app.get("/api/machines/{machine_id}/history/latest")
 def history_latest(machine_id: str, since: str, user=Depends(require_user)):
     validate_machine(machine_id)
-    since = since.replace("'", "")
-    query = f"""
-        SELECT time, {FIELD_LIST}
-        FROM "motor_metrics"
-        WHERE time > CAST('{since}' AS TIMESTAMP){machine_clause(machine_id)}
-        ORDER BY time ASC
-    """
-    return run_query(query)
+    if not RFC3339_RE.match(since):
+        raise HTTPException(status_code=400,
+                            detail="`since` must be an RFC 3339 timestamp")
+
+    # range() is inclusive of its start, but the cursor is the newest row the
+    # client already holds — so it is excluded explicitly to keep this a strict
+    # delta rather than re-sending that row on every poll.
+    flux = (_stream(since, machine_id, ALL_FIELDS)
+            + f'  |> filter(fn: (r) => r._time > time(v: "{since}"))\n'
+            + _PIVOT + '  |> sort(columns: ["_time"])\n')
+    return run_flux(flux)
 
 
 @app.get("/api/machines/{machine_id}/health")
 def health(machine_id: str, t: Thresholds = Depends(thresholds),
            user=Depends(require_user)):
     validate_machine(machine_id)
-    query = f"""
-        SELECT * FROM "motor_metrics"
-        WHERE 1=1{machine_clause(machine_id)}
-        ORDER BY time DESC LIMIT 1
-    """
-    rows = run_query(query)
-    return compute_health(rows[0], t) if rows else {}
+    row = _latest_row(machine_id)
+    return compute_health(row, t) if row else {}
 
 
 @app.get("/api/machines/{machine_id}/anomalies")
@@ -585,42 +898,14 @@ def anomalies(machine_id: str, seconds: int = 300, sigma: float = 3.0,
     sigma = max(0.1, min(sigma, 10.0))
     lookback = max(2, min(lookback, 500))
     bucket = _bucket_seconds(seconds, max_points)
-    where = f"time >= now() - INTERVAL '{seconds} seconds'{machine_clause(machine_id)}"
 
-    if bucket == 0:
-        source = f"""
-            SELECT time,
-                   GREATEST(vibration_x, vibration_y, vibration_z) AS peak_vibration
-            FROM "motor_metrics"
-            WHERE {where}
-        """
-    else:
-        source = f"""
-            SELECT date_bin(INTERVAL '{bucket} seconds', time) AS time,
-                   MAX(GREATEST(vibration_x, vibration_y, vibration_z)) AS peak_vibration
-            FROM "motor_metrics"
-            WHERE {where}
-            GROUP BY 1
-        """
+    flux = _stream(f"-{seconds}s", machine_id, _VIB_AXES)
+    if bucket:
+        flux += (f'  |> aggregateWindow(every: {bucket}s, fn: max, '
+                 'createEmpty: false, timeSrc: "_start")\n')
+    flux += _PIVOT + '  |> sort(columns: ["_time"])\n'
 
-    query = f"""
-        SELECT time, peak_vibration,
-               moving_avg + (std_dev * {sigma}) AS upper_bound,
-               moving_avg - (std_dev * {sigma}) AS lower_bound,
-               moving_avg
-        FROM (
-            SELECT time, peak_vibration,
-                   AVG(peak_vibration) OVER (
-                       ORDER BY time ROWS BETWEEN {lookback} PRECEDING AND CURRENT ROW
-                   ) AS moving_avg,
-                   STDDEV(peak_vibration) OVER (
-                       ORDER BY time ROWS BETWEEN {lookback} PRECEDING AND CURRENT ROW
-                   ) AS std_dev
-            FROM ({source}) AS src
-        ) AS stats
-        ORDER BY time ASC
-    """
-    return run_query(query)
+    return _rolling_bounds(_peak_rows(run_flux(flux)), sigma, lookback)
 
 
 @app.get("/api/machines/{machine_id}/root-cause-history")
@@ -630,36 +915,83 @@ def root_cause_history(machine_id: str, limit: int = 10, seconds: int = 0,
     validate_machine(machine_id)
     limit = max(1, min(limit, 500))
     warn, crit, tw, tc = t.vib_warn, t.vib_critical, t.temp_warn, t.temp_critical
+    for value in (warn, crit, tw, tc):
+        if not math.isfinite(value):
+            raise HTTPException(status_code=400, detail="Thresholds must be finite")
 
-    window = ""
-    if seconds > 0:
-        window = f"AND time >= now() - INTERVAL '{min(seconds, 7 * 24 * 3600)} seconds'"
+    # Unbounded in the old SQL; Flux requires a range, so "all of it" becomes
+    # MAX_LOOKBACK. Faults older than that are not reachable from this route.
+    start = f"-{min(seconds, 7 * 24 * 3600)}s" if seconds > 0 else f"-{MAX_LOOKBACK}"
 
-    query = f"""
-        SELECT time,
-            CASE
-                WHEN temperature > {tc} THEN 'Thermal Overload'
-                WHEN vibration_z > {warn} THEN 'Axial Misalignment'
-                WHEN vibration_y > {warn} THEN 'Vertical Looseness'
-                WHEN vibration_x > {warn} THEN 'Horizontal Unbalance'
-                WHEN temperature > {tw} THEN 'Elevated Temperature'
-            END AS fault_type,
-            CASE
-                WHEN temperature > {tc} THEN 'Immediate shutdown: high risk of fire or winding failure.'
-                WHEN vibration_z > {crit} THEN 'CRITICAL: vibration is damaging the motor (Zone D).'
-                WHEN vibration_z > {warn} THEN 'Urgent: bearings and couplings under stress (Zone C).'
-                WHEN vibration_y > {warn} THEN 'Caution: foundation bolts are loose; inspect mounting.'
-                WHEN vibration_x > {warn} THEN 'Maintenance: schedule a cleaning or balancing.'
-                WHEN temperature > {tw} THEN 'Monitor: running warmer than the configured normal band.'
-            END AS urgency
-        FROM "motor_metrics"
-        WHERE (vibration_x > {warn} OR vibration_y > {warn} OR vibration_z > {warn}
-               OR temperature > {tw})
-        {window}{machine_clause(machine_id)}
-        ORDER BY time DESC
-        LIMIT {limit}
-    """
-    return run_query(query)
+    # The exceedance test runs server-side so only the handful of rows that
+    # actually tripped a limit cross the network — a seven-day window is far too
+    # much to pull back and sift here. That means comparing against the *stored*
+    # column names and the *stored* scale, which is what _source_name and
+    # _source_limit supply; the values are cast to float first because Flux
+    # refuses to compare an integer column against a float literal.
+    #
+    # Classification stays in Python, on the un-scaled values: Flux has no CASE,
+    # and this keeps one copy of the cascade rather than a second one in Flux
+    # that could drift away from it.
+    vx_s, vy_s, vz_s = (_source_name(a) for a in _VIB_AXES)
+    temp_s = _source_name("temperature")
+    vib_limit = _source_limit("vibration_x", warn)
+    temp_limit = _source_limit("temperature", tw)
+
+    flux = (_stream(start, machine_id, _VIB_AXES + ["temperature"])
+            + '  |> map(fn: (r) => ({ r with _value: float(v: r._value) }))\n'
+            + _PIVOT
+            + f'  |> filter(fn: (r) => r["{vx_s}"] > {float(vib_limit)!r} '
+              f'or r["{vy_s}"] > {float(vib_limit)!r} '
+              f'or r["{vz_s}"] > {float(vib_limit)!r} '
+              f'or r["{temp_s}"] > {float(temp_limit)!r})\n'
+            + '  |> sort(columns: ["_time"], desc: true)\n'
+            + f'  |> limit(n: {limit})\n')
+
+    out = []
+    for row in run_flux(flux):
+        vx = row.get("vibration_x") or 0
+        vy = row.get("vibration_y") or 0
+        vz = row.get("vibration_z") or 0
+        temp = row.get("temperature") or 0
+
+        if temp > tc:
+            fault = "Thermal Overload"
+        elif vz > warn:
+            fault = "Axial Misalignment"
+        elif vy > warn:
+            fault = "Vertical Looseness"
+        elif vx > warn:
+            fault = "Horizontal Unbalance"
+        elif temp > tw:
+            fault = "Elevated Temperature"
+        else:
+            fault = None
+
+        if temp > tc:
+            urgency = "Immediate shutdown: high risk of fire or winding failure."
+        elif vz > crit:
+            urgency = "CRITICAL: vibration is damaging the motor (Zone D)."
+        elif vz > warn:
+            urgency = "Urgent: bearings and couplings under stress (Zone C)."
+        elif vy > warn:
+            urgency = "Caution: foundation bolts are loose; inspect mounting."
+        elif vx > warn:
+            urgency = "Maintenance: schedule a cleaning or balancing."
+        elif temp > tw:
+            urgency = "Monitor: running warmer than the configured normal band."
+        else:
+            urgency = None
+
+        # The server-side pre-filter works on scaled integers and so rounds a
+        # hair wider than the exact limits; a row that squeezes through it but
+        # exceeds nothing classifies to None. Those are dropped rather than
+        # listed as a fault with no name.
+        if fault is None:
+            continue
+
+        out.append({"time": row["time"], "fault_type": fault, "urgency": urgency})
+    return out
 
 
 # --------------------------------------------------------------------------

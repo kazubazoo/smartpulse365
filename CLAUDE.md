@@ -130,6 +130,31 @@ not a restart.
 `pdm-backend/main.py`. The browser talks to FastAPI (telemetry) and Supabase
 (auth, settings, machine registry) only.
 
+**This project does not write to the cloud InfluxDB — it only reads.** The write
+path is Novaflow's: Node-RED publishes to their MQTT broker and their ingest
+lands the data in the bucket. So the MQTT branch of the flow *is* the acquisition
+path to the cloud, not optional plumbing, and the Node-RED InfluxDB node is for
+the local store only. Never repoint it at the cloud server.
+
+**The cloud bucket holds the MQTT guideline's schema, not this dashboard's.**
+Because Novaflow's ingest consumes what *Build MQTT Payload* publishes, the
+fields there are named `motor_VBR_VX`, `motor_temperature`, `motor_RPM` and so
+on, the asset is tagged `device_id` (the flow sends `MOTOR001`), and **every
+value is a scaled integer** — the guideline types all measurements as INTEGER.
+`GUIDELINE_FIELDS` in `main.py` maps each one back to a dashboard field name and
+divides by the factor the flow multiplied by. That table and the flow's `SCALE`
+table must change together: reading `motor_VBR_VX`'s 124 as 124 mm/s rather than
+1.24 mm/s puts a healthy motor three zones past critical and alarms for ever.
+Set `INFLUX_SCHEMA=native` to read a store whose names and units are already
+correct.
+
+Two consequences worth remembering. `speed_command_hz` **cannot be read from the
+cloud at all** — the guideline payload has no field for the VFD's commanded
+frequency — so the Set Frequency panel is legitimately empty until that field is
+added to the MQTT payload. And the ids must line up: `device_id` in the bucket is
+`MOTOR001`, so the Supabase machine registry (or `MACHINES`) has to use that same
+id, or the machine shows no data.
+
 **The backend is stateless.** Every threshold — vibration limits, temperature
 limits, anomaly sigma, lookback, health full-scale — arrives as a query
 parameter with a sensible default. The API stores no configuration. Do not add
@@ -183,14 +208,33 @@ only.
   every Recharts `Line`.
 - Min/max decimation before rendering, preserving spike amplitude.
 
-**InfluxDB 3 Core uses SQL, not Flux.** Flux examples found online do not
-apply. Timestamp comparisons need explicit `CAST(... AS TIMESTAMP)`. Time-series
-queries must filter by time range and `ORDER BY time ASC` — `ORDER BY time DESC
-LIMIT n` without a time filter silently returns only the newest n rows.
+**There are two telemetry stores, and they speak different languages.** Get
+these the wrong way round and nothing works:
 
-**Long windows are bucketed server-side** with `date_bin`, taking `MAX` of
-vibration/displacement and `AVG` of everything else, so transient impulses keep
-their real amplitude at coarse zoom. Preserve that asymmetry.
+- **The cloud store** (`sm365db.novaplus.my`) is **InfluxDB 2.x — Flux**. This
+  is what `pdm-backend/main.py` reads, and therefore what the dashboard shows.
+  Flux specifics that shape every query there: `range()` is mandatory (there is
+  no unbounded `ORDER BY time DESC LIMIT 1`, so routes fall back to
+  `MAX_LOOKBACK`); results arrive long, so every query ends in `pivot()` to
+  rebuild wide rows; and there is no windowed `STDDEV`, no `GREATEST` and no
+  `CASE`, so rolling statistics and fault classification happen in Python.
+- **The local `influxdb` container** is still **InfluxDB 3 Core — SQL**, written
+  by the Node-RED flow and read by Grafana. SQL notes for *that* store:
+  timestamp comparisons need explicit `CAST(... AS TIMESTAMP)`, and
+  `ORDER BY time DESC LIMIT n` without a time filter silently returns only the
+  newest n rows.
+
+The backend cannot read the local store at all — different query language — so
+the dashboard has no data source other than the cloud one.
+
+**Long windows are bucketed server-side**, taking `MAX` of vibration/
+displacement and `AVG` of everything else, so transient impulses keep their real
+amplitude at coarse zoom. Preserve that asymmetry. In Flux this is two
+`aggregateWindow` branches (`fn: max` and `fn: mean`) unioned before the pivot,
+and two details are load-bearing: `createEmpty: false`, so an empty window is
+omitted rather than fabricated as a zero, and `timeSrc: "_start"`, because the
+Flux default stamps a window with its *end* and would shift every point one
+bucket into the future relative to the old `date_bin` behaviour.
 
 **Never fabricate data to fill gaps.** Missing telemetry is rendered as a gap
 (`connectNulls={false}`) against an axis that spans the full selected window. In
@@ -238,8 +282,33 @@ is a separate question answered by `POST /api/connectivity/test`.
   exits on startup (`Unable to open config file`). Create the file — see
   "Setup on a fresh clone". MQTT is not on the acquisition path, so the rest of
   the stack runs fine meanwhile.
+- **The API refuses to send the InfluxDB token in cleartext.** `INFLUX_URL` must
+  be `https://` for any host with a dot in its name; a single-label host
+  (`influxdb`, `localhost`) is a container or loopback and is allowed over http,
+  so local work needs no exception. Otherwise every telemetry route returns 503
+  and `/api/health` reports `telemetry_blocked` with the reason — a visible
+  refusal rather than a dashboard that merely looks offline.
+  `INFLUX_ALLOW_INSECURE=true` overrides it. Certificate verification is on and
+  must stay on: accepting any certificate would leak the token to an interceptor
+  while still looking encrypted.
+- **There is no working TLS route to the cloud InfluxDB yet.** Apache 2.4 on
+  that host has a valid Let's Encrypt certificate and redirects `:80` to
+  `https`, but the vhost does not usefully proxy InfluxDB: `/ping` and `/health`
+  404, and `/api/v2/*` returns **503** — the tell-tale sign of a `ProxyPass`
+  whose upstream is dead (nothing listens on `:8181` there, which is probably
+  what it points at). Only plaintext `:8086` works, so until the proxy is fixed
+  to forward `/` to `127.0.0.1:8086`, every API request would carry the token in
+  cleartext across the public internet. Check this before pointing the API at it.
+- **Line protocol with CRLF line endings is accepted and silently discarded.**
+  A `POST /api/v2/write` whose body has `\r\n` line endings — which is what
+  Python's `print` produces when redirected on Windows — returns **204 No
+  Content** and stores nothing at all. Pipe through `tr -d '\r'` first. The
+  success status makes this look like a query problem rather than a write one.
 - **The fleet query hits InfluxDB Core's Parquet file cap and the whole
-  dashboard goes `OFFLINE`.** `GET /api/machines` scans a 7-day window; Core
+  dashboard goes `OFFLINE`.** *(Applies to the local InfluxDB 3 store and so to
+  Grafana, not to the API's cloud reads: the fleet roll-up there is a `last()`
+  pushdown, and a failed query now surfaces as a 502 instead of being swallowed
+  into an empty list.)* `GET /api/machines` scans a 7-day window; Core
   never compacts, so a 1 Hz feed crosses the default 432-file limit within a
   day or two. The query then 500s, `run_query()`/the `except` clause turns that
   into `[]`, and every machine renders offline with live data still arriving.
