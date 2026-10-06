@@ -1,552 +1,96 @@
 # Predictive Maintenance Module
 
-A self-contained condition-monitoring dashboard for industrial motors. It polls
-a PLC over Modbus TCP, stores the readings as time-series data, scores machine
-health against the vibration standard each asset is configured for (ISO 10816-1,
-ISO 20816-3 / 10816-3, or custom limits), and serves it all through a web
-dashboard.
+A condition-monitoring dashboard for an industrial motor. It shows live
+vibration, temperature, speed and electrical readings, scores machine health
+against ISO vibration standards, flags statistical anomalies, and classifies
+faults — so plant operators can see a problem developing before it becomes a
+breakdown.
 
-Runs entirely on one machine with `docker compose up`. No cloud services are
-required — Supabase adds login and shared machine configuration when you want
-it, and is optional.
-
----
-
-## What it does
-
-**Fleet overview.** Every machine on one screen with its run state, health
-score, recent anomaly count, temperature and frequency. Click through to
-diagnostics.
-
-**Three distinct states.** `RUNNING`, `IDLE` (reporting but stopped) and
-`OFFLINE` (nothing arriving) are kept separate, so a dead sensor never looks
-like a machine somebody switched off.
-
-**Diagnostics.** Vibration velocity, displacement and dominant frequency per
-axis; motor temperature; V/Hz, load, current and torque trends; a composite
-health score with plain-language commentary; and a fault-classification history.
-
-**Anomaly detection.** A rolling mean with a ±sigma band computed in SQL.
-Sigma, window length and noise floor are all editable from the dashboard.
-
-**Grafana-style time ranges.** 1 minute to 7 days. Short windows tail live at
-1 Hz; longer ones are aggregated server-side so a 24-hour view returns ~1,500
-points instead of 86,400. Axis labels adapt from seconds to weekday-and-date.
-
-**Everything is tunable from the UI, at the right scope.** Settings are split in
-two. *Machine configuration* — vibration standard, alarm limits, temperature
-limits, anomaly tuning and gauge ranges — belongs to the asset and is shared by
-everyone who views it. *Display preferences* — time range, refresh rate, chart
-resolution, inactivity timeout — are yours alone. Both are applied server-side;
-the API still stores nothing.
-
-**Vibration limits come from a standard.** Choose ISO 10816-1 (classes I–IV) or
-ISO 20816-3 / 10816-3 (group and support), enter the machine's rated power,
-shaft height and mounting, and the dashboard suggests the class and derives the
-warning and critical limits straight from the published table. Equipment no
-table covers can use custom limits instead.
-
-**Machine management.** Add machines, set names, locations and connection
-details from the dashboard, and test whether a PLC is actually reachable before
-committing the configuration.
-
----
-
-## Architecture
+## How it works
 
 ```
-  WTVB01-485 vibration sensor ──┐
-                                │ Modbus RTU
-  VFD / inverter drive ─────────┤
-                                ▼
-                        Inovance Easy320 PLC
-                                │  Modbus TCP, polled 1 Hz
-                                ▼
-                            Node-RED                    acquisition only:
-                   join → scale → tag → route           no analytics here
-                                │
-                                │ 1 Hz, tagged machine_id
-                                ▼
-                      InfluxDB 3 Core (SQL)             time-series store
-                                │
-                                │ SQL over HTTP
-                                ▼
-                       FastAPI (pdm-backend)            all processing:
-              health, anomalies, faults, downsampling   stateless
-                                │
-                                │ JSON
-                                ▼
-                    React + Vite (pdm-frontend)         rendering only
+ PLC + vibration sensor                                   Operator's browser
+        │ Modbus TCP                                              ▲
+        ▼                                                         │
+   Node-RED  ──MQTT──▶  Novaflow broker  ──▶  Cloud InfluxDB  ──▶  FastAPI  ──▶  React dashboard
+   (polls 1×/s)        (company, remote)     (company, remote)    (reads only)
 ```
 
-Supabase sits alongside, serving the browser directly for **authentication**,
-**per-user display preferences**, and the **shared machine registry** — which
-also carries each machine's vibration standard and alarm limits.
+1. **Node-RED** polls the PLC over Modbus TCP every second, converts the raw
+   registers into readings, and publishes them to the company's MQTT broker.
+2. **Novaflow's ingest** (not part of this repo) stores those messages in the
+   company's cloud **InfluxDB**.
+3. **FastAPI** (`pdm-backend/`) reads from that InfluxDB, converts the stored
+   values back into real units, and computes health, anomalies and faults.
+4. **The React dashboard** (`pdm-frontend/`) shows it all. Logins, the machine
+   list and saved settings live in **Supabase**.
 
-### Layer responsibilities
+This project only *reads* the cloud database — it never writes to it.
 
-| Layer | Does | Does not |
-|---|---|---|
-| Node-RED | Reads registers, converts to engineering units, tags with `machine_id`, writes to InfluxDB and Postgres | Any analytics or user-facing content |
-| InfluxDB 3 Core | Stores every reading, 1 Hz | Compute beyond SQL aggregation |
-| FastAPI | Health scoring, anomaly detection, fault classification, time bucketing | Hold configuration — it is stateless |
-| React | Render, and own the settings | Touch the database directly |
+Node-RED also writes a copy to a **local** InfluxDB, which only the Grafana
+prototype dashboard uses. The main dashboard does not read it.
 
-**The frontend never talks to InfluxDB.** All database access is server-side, so
-the database need not be publicly reachable — only the API does. Keep it that
-way if you deploy this.
+## What you need
 
-**The backend holds no configuration.** Thresholds arrive as query parameters
-with sensible defaults. The dashboard owns the values: alarm limits and analytic
-tuning are stored against the *machine* (so every operator sees an asset scored
-the same way), display preferences against the *user*.
+- Docker Desktop
+- Node.js 22.13 or newer (20.19+ also works)
+- A **read-only token** for the cloud InfluxDB bucket
+- Optionally, a Supabase project (for logins and saving settings)
 
-**`machine_id` is the join key** between the Node-RED tag, the Supabase registry
-and the API route. All three must agree, or a machine shows no data.
-
----
-
-## Quick start
-
-Requires Docker Desktop and Node.js 20+.
-
-On a fresh clone the pipeline is **inert until Node-RED is set up** (step 5).
-Docker starts every container, but nothing polls the PLC and nothing writes to
-InfluxDB until you import and deploy the acquisition flow — so the dashboard
-correctly shows every machine `OFFLINE` until then. Registering a machine, or a
-passing *Test connection*, does not change this.
-
-### 1. Clone and configure
+## Setup
 
 ```bash
-git clone https://github.com/kazubazoo/smartpulse365.git
-cd smartpulse365
+# 1. Configuration
 cp .env.example .env
-```
+#    Edit .env: set INFLUX_TOKEN, and INFLUX_ALLOW_INSECURE=true
+#    (needed until the InfluxDB server has HTTPS).
 
-### 2. Create the Mosquitto config
-
-`mosquitto/` is gitignored, so `mosquitto/config/mosquitto.conf` does not exist
-on a fresh clone. The `eclipse-mosquitto` image exits immediately without it and
-Docker restart-loops the container. Create a minimal one:
-
-```bash
-mkdir -p mosquitto/config
-cat > mosquitto/config/mosquitto.conf <<'EOF'
-listener 1883
-allow_anonymous true
-listener 9001
-protocol websockets
-persistence true
-persistence_location /mosquitto/data/
-log_dest stdout
-EOF
-```
-
-The MQTT broker is infrastructure only — the acquisition flow writes straight to
-InfluxDB and Postgres — but the container should still start cleanly.
-
-### 3. Mint the InfluxDB token
-
-The admin token can only be created once the server is running, and is shown
-once:
-
-```bash
-docker compose up -d influxdb
-docker compose exec influxdb influxdb3 create token --admin
-# → paste the apiv3_... value into .env as INFLUXDB3_AUTH_TOKEN
-```
-
-### 4. Start the stack
-
-```bash
+# 2. Start the backend services
 docker compose up -d --build
-```
 
-The `machine_telemetry` database and its tables are created automatically on the
-first write from Node-RED — no further InfluxDB CLI work.
-
-### 5. Set up Node-RED — required, nothing works without this
-
-`node-red-flows/flows.json` is the portable *definition* of the acquisition
-flow; it is not loaded automatically. Import it once:
-
-1. Open http://localhost:1880 → Menu (☰) → **Import** → select
-   `node-red-flows/flows.json` → **Import** → **Deploy**.
-2. Double-click the **Modbus** client config node (pencil next to the *Server*
-   field on any `D…` read node) and set the PLC's **Host**, **Port** (usually
-   `502`) and **Unit-Id**.
-3. Double-click **Stream to InfluxDB** → pencil next to the *Server* field, and
-   set:
-   - **Version**: `2.0`
-   - **URL**: `http://influxdb:8181`
-   - **Token**: the `apiv3_…` token from `.env`
-   - **Organization**: `Factory_Module`  **Bucket**: `machine_telemetry`
-4. In the **Map, Scale & Process Buffer** function node, set `machineId` to the
-   Machine ID you will register (default `motor01`).
-5. **Deploy** again.
-
-Watch the debug sidebar and InfluxDB Explorer (http://localhost:8888): rows
-tagged with your `machine_id` should appear within a second or two. Writes that
-fail with `401 Unauthorized` mean the **Token** field in step 3 is empty or
-wrong.
-
-> Node-RED keeps that token in `node_red_data/` (gitignored). Deleting that
-> directory loses the credential — re-enter it in step 3 and redeploy.
-
-### 6. Build and open the dashboard
-
-```bash
+# 3. Build and serve the dashboard
 cd pdm-frontend
-npm ci && npm run build && npm run preview     # http://localhost:4173
+cp .env.example .env.local     # add Supabase URL + anon key, or leave blank for no login
+npm ci
+npm run build
+npm run preview                # → http://localhost:4173
 ```
 
-> Use `npm run build && npm run preview`, never `npm run dev`. React 19's
-> dev-mode instrumentation leaks memory outside the V8 heap and will eventually
-> crash the tab at this data rate.
+That is enough to see live data on the dashboard.
 
-Without Supabase (see below) the dashboard opens straight to the Overview. Add
-the machine on the **Machines** page using the same Machine ID you set in
-Node-RED step 4; it flips from `OFFLINE` to `RUNNING`/`IDLE` within 30 seconds
-of the first row.
+**To collect data from a PLC yourself** (only needed on the machine connected
+to the PLC): open Node-RED at http://localhost:1880, import
+`node-red-flows/flows.json` from the menu, set the Modbus host to the PLC's IP
+address, and click **Deploy**.
 
-### Services
+**To enable logins:** run `supabase/schema.sql` in the Supabase SQL Editor,
+create a user under *Authentication → Users*, and put the same Supabase URL and
+anon key in both `.env` and `pdm-frontend/.env.local`. Rebuild the frontend
+afterwards — those values are baked in at build time.
 
-| Service | Default port | Purpose |
-|---|---|---|
-| Dashboard | 4173 | React frontend |
-| API | 8000 | FastAPI (`/docs` for OpenAPI) |
-| Node-RED | 1880 | Modbus acquisition |
-| InfluxDB 3 Core | 8181 | Time-series storage |
-| InfluxDB 3 Explorer | 8888 | Web GUI to browse and query the data |
-| Grafana | 3000 | Prototype dashboard, provisioned automatically |
-| Postgres | 5432 | Status/event log |
-| Mosquitto | 1883 / 9001 | MQTT broker |
+> Always use `npm run build` + `npm run preview`. `npm run dev` leaks memory at
+> this data rate and eventually crashes the browser tab.
 
-Ports are **not** auto-detected — Docker fails to bind rather than picking
-another. If the host already runs Node-RED or an MQTT broker, override in
-`.env`:
+## Where things are
 
-```
-NODE_RED_PORT=1881
-MQTT_PORT=1884
-MQTT_WS_PORT=9002
-```
-
-Every service has an equivalent variable (`API_PORT`, `GRAFANA_PORT`,
-`INFLUXDB_PORT`, `POSTGRES_PORT`, `INFLUXDB_EXPLORER_PORT`).
-
-### Grafana prototype dashboard
-
-Grafana was the original visualisation layer, used to prove the predictive-
-maintenance approach before the React dashboard was built. It is kept as a
-working reference and is **provisioned automatically** — open
-http://localhost:3000 (admin/admin) and it lands straight on
-*Motor 01 (Testing PM)*, all 16 panels wired up. Nothing to import.
-
-Provisioning lives in `grafana/`:
-
-```
-grafana/
-├── dashboards/motor01-prototype.json      the dashboard itself
-└── provisioning/
-    ├── datasources/influxdb.yml           SQL against InfluxDB 3
-    ├── datasources/postgres.yml           status log for the Motor Status panel
-    └── dashboards/dashboards.yml          loads everything above on startup
-```
-
-Datasource UIDs are pinned because the dashboard references them by UID —
-change one and you must change both.
-
-Panels read from InfluxDB directly, so they show `No data` until telemetry
-arrives, exactly like the React dashboard.
-
-
----
-
-## Using it with your own hardware
-
-### 1. Register the machine
-
-On the dashboard's **Machines** page, add a machine. The **Machine ID** is the
-identifier that links everything together — pick something stable like
-`motor01`. Set the PLC's host and port, then press **Test connection**: it opens
-a real socket from the API container and sends a Modbus *Read Holding Registers*
-frame, distinguishing a timeout, a refused connection, an unresolvable hostname
-and a device that actually answers.
-
-### MQTT publishing to the Novaflow broker
-
-The flow publishes every reading to the company Mosquitto broker alongside the
-InfluxDB write, following the *Node-RED MQTT Publishing Guideline v1.0*.
-
-- Topic `pmm/<site_id>/<device_id>` (default `pmm/SITE001/MOTOR001`), QoS 1,
-  retain false.
-- Site and device identity are constants at the top of the
-  **Build MQTT Payload** function node.
-- Broker host, port and client ID are in the flow; **username and password are
-  not** — Node-RED keeps those in `flows_cred.json`, which is gitignored. Enter
-  them once in the editor (broker node → Security tab) after importing. The
-  broker rejects the connection until they are set.
-- **The client ID must be unique on the broker.** It defaults to
-  `novaflow-pdm-nodered-01`. If anything else connects with the same ID — a
-  second Node-RED, an MQTT Explorer session with a fixed ID, another device —
-  the broker disconnects whichever connected first, and the two clients flap
-  in a ~15-second connect/disconnect loop. Give each connection its own ID.
-- For a self-contained bench, point the broker node at the local `mosquitto`
-  service (`mosquitto:1883`, anonymous) instead, and subscribe MQTT Explorer to
-  `localhost:1883` → `pmm/#`. The flow only publishes to the one broker its
-  broker node names, so MQTT Explorer must be pointed at that same broker.
-
-**All measurements are transmitted as scaled integers.** Each value is
-multiplied by its factor and rounded; consumers divide by the same factor. The
-factors match the precision the sensor actually reports, so the transmitted
-integer is generally the raw Modbus register value again — nothing invented,
-nothing lost.
-
-| Field | Factor | Example |
-|---|---|---|
-| `motor_frequency` | 100 | 49.97 Hz → `4997` |
-| `motor_RPM` | 10 | 1452.4 rpm → `14524` |
-| `motor_amp` | 100 | 4.48 A → `448` |
-| `motor_power` / `motor_torque` | 10 | 2.2 kW → `22` |
-| `motor_VBR_chiptemp` | 100 | 31.50 °C → `3150` |
-| `motor_VBR_V*` (velocity) | 100 | 1.24 mm/s → `124` |
-| `motor_VBR_A*` (acceleration) | 1000 | 0.122 g → `122` (milli-g) |
-| `motor_VBR_F*` (frequency) | 10 | 24.6 Hz → `246` |
-| `motor_VBR_D*`, `motor_volt`, `motor_temperature`, `motor_status`, `motor_VBR_fault*` | 1 | already whole units |
-
-The factors live in one `SCALE` table at the top of the function node.
-
-`invt_bus_volt` is published as `null` — the VFD DC bus voltage register is not
-part of any current Modbus block. Null rather than `0` so a consumer can tell
-"not measured" from "measured as zero".
-
-### 2. Point Node-RED at the PLC
-
-Open Node-RED, import `node-red-flows/flows.json` (Menu → Import → Deploy), then
-edit the config nodes:
-
-- **Modbus client** — the PLC's **Host** / **Port** / **Unit-Id**.
-- **Stream to InfluxDB** (server config, pencil icon) — **Version** `2.0`,
-  **URL** `http://influxdb:8181`, **Token** = the `apiv3_…` value from `.env`,
-  **Organization** `Factory_Module`, **Bucket** `machine_telemetry`. An empty or
-  stale token shows up as repeated `401 Unauthorized` write errors in the log.
-- **Map, Scale & Process Buffer** function — set `machineId` to match the
-  Machine ID you registered.
-- **Deploy**.
-
-The flow reads four register blocks in parallel once per second, joins them,
-converts raw integers to engineering units (signed 16-bit reinterpretation for
-values that can go negative, byte-swapped IEEE-754 for 32-bit floats), and
-writes the result tagged with `machine_id`.
-
-Adapting to different hardware means changing the register map in that one
-function node. Nothing downstream needs to know.
-
-### 3. Set the machine's alarm limits
-
-**Settings → Machine configuration**, pick the machine, then:
-
-1. Enter the nameplate details — **rated power**, **shaft height** and how the
-   machine is **mounted**. Flexible mounts (anti-vibration feet, a light frame)
-   tolerate more movement than a rigid bolted baseplate.
-2. Choose the **standard** your site works to:
-
-   | Standard | Use it when |
-   |---|---|
-   | ISO 10816-1 | General classification by size and foundation. Sensible default for a single motor. |
-   | ISO 20816-3 | Current standard for industrial machines above 15 kW. Supersedes ISO 10816-3. |
-   | ISO 10816-3 | Same zone boundaries; kept for sites whose paperwork still cites the withdrawn number. |
-   | Custom | Equipment no published table covers, or an OEM specification. |
-
-3. The dashboard suggests the class from what you entered and explains why —
-   *"7.5 kW is a small machine (≤ 15 kW)"*. Accept it or override it. The
-   **warning** limit is the standard's B/C boundary and **critical** is C/D, read
-   straight from the table, so they cannot drift out of step with the class. The
-   severity bar shows where your machine's limits sit across zones A–D.
-4. Set the **anomaly detector** for this machine's own noise — a smooth
-   direct-drive fan tolerates a tighter sigma than a reciprocating compressor —
-   and the **gauge ranges** to its nameplate ratings.
-5. Press **Save changes**.
-
-These limits are shared: every operator sees this machine scored the same way.
-Your own **Display preferences** tab holds only what affects your screen.
-
-### 4. Confirm it is live
-
-A machine appears as `OFFLINE` with no health score until rows actually arrive —
-registry membership alone never makes it look running. Watch InfluxDB Explorer
-(port 8888) to confirm rows are landing with the right `machine_id`; the
-Overview flips to `RUNNING` within 30 seconds of the first write.
-
----
-
-## Optional: login and shared configuration
-
-Skip this to run unauthenticated on an isolated plant network.
-
-1. Create a project at [supabase.com](https://supabase.com).
-2. Run `supabase/schema.sql` in the SQL Editor (Dashboard → SQL Editor → New
-   query). It creates `user_settings` and `machines` with Row Level Security
-   policies restricting each account to its own settings, and seeds
-   `motor01`–`motor04`. Safe to re-run — and you **must** re-run it after
-   updating, to add the `machines.thresholds` column that per-machine alarm
-   limits are stored in. The Settings page shows a banner until you do.
-3. From Project Settings → API copy the **Project URL** and an **anon key** —
-   the long `eyJ…` JWT is the most broadly compatible — into **both** places
-   (the values must match):
-   - `.env` as `SUPABASE_URL` / `SUPABASE_ANON_KEY`
-   - `pdm-frontend/.env.local` as `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`
-     (copy it from `pdm-frontend/.env.example`)
-4. Under Authentication → Sign In / Providers → Email, turn **Confirm email**
-   off for a bench setup. Then decide how operators get accounts:
-
-   | **Allow new users to sign up** | What the login screen does |
-   |---|---|
-   | Off (default, recommended) | Sign-in only. Create each operator yourself under Authentication → Users. |
-   | On | A **Create account** tab appears beside Sign in, and anyone who can reach the dashboard can register. |
-
-   The login screen reads this setting from the project at load time, so
-   flipping it takes effect on the next page load — no rebuild. If it is off,
-   create at least one operator under Authentication → Users, or you cannot log
-   in at all.
-
-   With sign-ups **on**, anyone who can reach the URL can register and, once
-   signed in, read the whole machine registry and its telemetry — the Row Level
-   Security policies grant that to any authenticated user. That is reasonable on
-   an isolated plant network and is not if the dashboard is exposed more widely.
-5. `docker compose up -d api` (picks up the API-side vars) and rebuild the
-   frontend (`npm run build && npm run preview`).
-
-`VITE_*` variables are inlined at **build** time — changing them requires a
-rebuild, not a restart.
-
-The anon key is public by design; access is enforced by Row Level Security in
-the database, not by hiding the key. Never put the `service_role` key in the
-browser.
-
-Once configured, the dashboard requires login, the API rejects unauthenticated
-requests, and users get a Profile page with password change plus a
-forgot-password flow. Self-registration appears only when the project allows
-it, so an invite-only deployment never shows a tab that could only fail.
-
----
-
-## Repository layout
-
-```
-smartpulse365/
-├── docker-compose.yml       All services
-├── Dockerfile.node-red      Node-RED + required palette nodes
-├── .env.example             Configuration reference
-├── CLAUDE.md                Notes for Claude Code
-├── node-red-flows/
-│   └── flows.json           Exported acquisition flow
-├── pdm-backend/             FastAPI — all queries and processing
-│   └── main.py
-├── pdm-frontend/            React + Vite dashboard
-│   └── src/
-│       ├── components/      Charts, cards, pickers
-│       ├── contexts/        Auth, settings, machines
-│       ├── hooks/           useIdleLogout — inactivity sign-out
-│       ├── pages/           Overview, Diagnostics, Machines, Settings, Profile
-│       ├── lib/             API client, Supabase client, defaults, standards
-│       │   └── standards.js ISO 10816-1 / 20816-3 zone tables and class rules
-│       └── panels.js        Declarative chart configuration
-├── grafana/                 Provisioned dashboard and datasources
-├── postgres/init/           Schema applied on first database start
-├── supabase/schema.sql      Tables and RLS policies
-└── tools/demo_machine.py    Optional synthetic data for demos
-```
-
-Runtime data directories (`influxdb_data/`, `node_red_data/`, `postgres_data/`,
-etc.) are bind-mount volumes, excluded from version control and recreated on
-first start. `node-red-flows/flows.json` is committed because it is the portable
-*definition* of the flow, not runtime state — re-export it after editing in the
-Node-RED editor.
-
----
-
-## API
-
-All routes are namespaced per machine. Thresholds are query parameters.
-
-| Endpoint | Purpose |
+| Service | Address |
 |---|---|
-| `GET /api/health` | Liveness, and whether auth is enforced |
-| `GET /api/machines` | Fleet roll-up: state, health, anomaly counts. `limits` carries each machine's own alarm limits as `id:warn:crit:scale:tempwarn:tempcrit`, comma separated, so a fan and a compressor are not scored on one scale |
-| `GET /api/machines/{id}/latest` | Most recent snapshot |
-| `GET /api/machines/{id}/history` | Time window, bucketed to a point budget |
-| `GET /api/machines/{id}/history/latest` | Delta fetch for live tailing |
-| `GET /api/machines/{id}/health` | Health score and status |
-| `GET /api/machines/{id}/anomalies` | Rolling mean ± sigma band |
-| `GET /api/machines/{id}/root-cause-history` | Fault classification history |
-| `POST /api/connectivity/test` | Probe a PLC endpoint over Modbus TCP |
+| Dashboard | http://localhost:4173 |
+| API | http://localhost:8000/api/health |
+| Node-RED | http://localhost:1880 |
+| Grafana (prototype) | http://localhost:3000 |
+| Local InfluxDB Explorer | http://localhost:8888 |
 
-Interactive docs at `http://localhost:8000/docs`.
+| Folder | Contents |
+|---|---|
+| `pdm-backend/` | FastAPI service — all database access and analytics |
+| `pdm-frontend/` | React dashboard |
+| `node-red-flows/` | The data-acquisition flow |
+| `supabase/` | Database schema for logins, machines and settings |
+| `grafana/`, `postgres/` | The local prototype dashboard and its status log |
+| `tools/` | Optional demo-data generator (feeds Grafana only) |
 
----
-
-## Notes and limitations
-
-**Acceleration reads zero.** The `accel_x/y/z` registers return hard zeros. The
-WTVB01-485 firmware integrates acceleration internally to derive velocity but
-does not expose the raw values — confirmed by controlled substitution testing.
-The fields are kept in the payload deliberately so the gap stays visible.
-
-**Gaps are shown as gaps.** Missing telemetry is never backfilled with zeros. In
-a vibration-monitoring system a fabricated zero reads as "measured and still"
-when the truth is "not measured", which hides failed sensors.
-
-**Charts with alarm lines are scaled to the alarm, not to the data.** A quiet
-machine reading 0.05 mm/s against a 1.8 mm/s limit sits near the bottom of the
-chart, and that is the honest picture — auto-fitting the axis would turn its
-noise into a dramatic-looking trace. Use the **Fit** toggle in a chart's header
-to zoom into fine structure; the axis turns amber and the chart is marked
-*zoomed* so a close-up is never mistaken for a severe reading.
-
-**Signing out after inactivity.** Default 30 minutes, changeable under Display
-preferences, with a warning 60 seconds before. Only mouse, keyboard, touch and
-scroll count as activity — the dashboard's own polling deliberately does not, or
-an unattended terminal would never time out.
-
-**Online is data recency, not reachability.** A machine is online while its
-newest reading is younger than `ONLINE_WINDOW_SECONDS` (default 30). Use *Test
-connection* to answer the separate question of whether the device is reachable.
-
-**Development credentials.** Postgres (`admin`/`admin`) and the Grafana admin
-password are literals in `docker-compose.yml`. Rotate them before any
-deployment. Node-RED stores its credentials unencrypted on this configuration.
-
-**The Modbus link is site-local.** If the application tier moves to the cloud,
-Node-RED stays on-premises and pushes to a cloud endpoint, or you need a VPN or
-edge gateway. That is the main topology decision for a hosted deployment.
-
-**One program can hold the PLC's Modbus TCP port at a time.** While the Node-RED
-flow is deployed it keeps a socket open to the PLC, and the Inovance
-programming software (AutoShop) then reports the PLC as *in use* and refuses to
-go online. Stop the flow first — `docker compose stop node-red`, or disable the
-Modbus client node and Deploy — then reconnect AutoShop; restart Node-RED when
-you are done programming.
-
-**Timezone.** Every service container runs `TZ=Asia/Kuala_Lumpur`
-(`docker-compose.yml`). InfluxDB still stores timestamps in UTC — as it must —
-and the React app converts them to Malaysian time on display. The env var is
-what keeps the MQTT payload's `dts` field and the Node-RED / Grafana clocks on
-local wall-clock time rather than 8 hours behind.
-
-**InfluxDB 3 Core does not compact.** A 1 Hz feed accumulates Parquet files
-until a query would scan more than `INFLUXDB3_QUERY_FILE_LIMIT` (raised to
-`20000` in `docker-compose.yml`, up from the 432 default) and starts returning
-500 — which surfaces as the dashboard showing every machine `OFFLINE` while
-InfluxDB Explorer still shows fresh data. Set a retention period on the
-`machine_telemetry` database, or move to InfluxDB 3 Enterprise (free for
-non-commercial use), for a permanent fix.
-
-**InfluxDB 3 Core uses SQL, not Flux.** Flux examples found online do not apply
-here. InfluxDB 2.x was considered for its built-in UI and rejected — the
-`date_bin` bucketing and `AVG`/`STDDEV` window functions behind anomaly
-detection have no clean Flux equivalent. InfluxDB 3 Explorer provides the GUI
-instead, and InfluxDB 3 auto-creates databases and tables on write, so Node-RED
-never needs a CLI.
+**`PassOver.md`** is the full handover guide: how every part works, where the
+code is, configuration, common tasks and troubleshooting. `CLAUDE.md` has the
+engineering notes — the rules that must not be broken, and problems that have
+already been solved once.

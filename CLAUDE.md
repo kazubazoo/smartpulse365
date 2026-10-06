@@ -91,12 +91,16 @@ produces no data until the Node-RED flow is imported and deployed** (step 5) —
 until then every machine is correctly `OFFLINE`. `docker compose up` alone is
 not enough.
 
-1. `cp .env.example .env`
+1. `cp .env.example .env`, then set `INFLUX_TOKEN` (a read-only token for the
+   cloud bucket) and `INFLUX_ALLOW_INSECURE=true` until that server has TLS.
+   This is the only step the dashboard itself needs to show data; the rest
+   set up the acquisition side and the local tools.
 2. Create `mosquitto/config/mosquitto.conf`. `mosquitto/` is gitignored, so the
    file is absent on a fresh clone and the `eclipse-mosquitto` image crash-loops
    without it. A minimal anonymous listener on 1883 plus websockets on 9001 is
-   enough. MQTT is not on the acquisition path (the flow writes straight to
-   InfluxDB and Postgres) but the container should still start.
+   enough. This *local* broker is not on the acquisition path — the flow
+   publishes to Novaflow's remote broker, not this one — but the container
+   should still start.
 3. `docker compose up -d influxdb` then
    `docker compose exec influxdb influxdb3 create token --admin` — the token
    cannot be minted before the server runs, and is shown only once. Put it in
@@ -150,8 +154,9 @@ correct.
 
 Two consequences worth remembering. `speed_command_hz` **cannot be read from the
 cloud at all** — the guideline payload has no field for the VFD's commanded
-frequency — so the Set Frequency panel is legitimately empty until that field is
-added to the MQTT payload. And the ids must line up: `device_id` in the bucket is
+frequency — so the Diagnostics page charts Output Frequency only, with a
+footnote saying why, until that field is added to the MQTT payload. And the ids
+must line up: `device_id` in the bucket is
 `MOTOR001`, so the Supabase machine registry (or `MACHINES`) has to use that same
 id, or the machine shows no data.
 
@@ -183,14 +188,17 @@ never drift out of step with the class. Only `standardId: 'custom'` keeps
 hand-entered values. The shipped default is ISO 10816-1 Class I, which is where
 the original 1.8 / 4.5 mm/s defaults came from.
 
-**`machine_id` is the join key.** It is an InfluxDB tag written by the Node-RED
-flow, the primary key of the Supabase `machines` table, and the path segment in
-`/api/machines/{id}/...`. All three must agree or a machine shows no data.
+**The machine id is the join key.** In the cloud bucket it is the `device_id`
+tag (the flow publishes `MOTOR001`); it is also the primary key of the Supabase
+`machines` table and the path segment in `/api/machines/{id}/...`. All three
+must agree or a machine shows no data. The API renames the tag to `machine_id`
+in every row it returns, so nothing downstream cares which schema it came from.
 
-**Rows with a NULL `machine_id`** (written before the tag existed) are
-attributed to `DEFAULT_MACHINE_ID`. The API also detects when the column does
-not exist at all and drops the filter, so a single-motor deployment that never
-writes the tag still works.
+**Untagged legacy rows** are attributed to `DEFAULT_MACHINE_ID` — but only in
+the native schema (a local store with rows written before the tag existed). The
+cloud bucket tags every row, and the `or tag == ""` fallback that rescues legacy
+rows is far too expensive to run there (see Traps). The API also detects when
+the tag does not exist at all and drops the filter.
 
 ## Constraints — do not regress these
 
@@ -251,8 +259,17 @@ close-up is never mistaken for a severe reading. Do not make Fit the default.
 
 **Fault diagnosis codes are codes, not measurements.** `fault_x/y/z` are
 bucketed with `MAX` (never `AVG` — the mean of code 0 and code 20 is code 10, a
-different fault) and drawn as `stepAfter` lines, so no value the sensor never
-emitted is ever drawn.
+different fault) and drawn by `FaultCodeTimeline` as one lane per axis rather
+than as a line chart — no numeric axis implying code 20 is "twice" code 10, no
+axis hidden under another, and no value interpolated between readings.
+
+**A stopped motor is not scored.** `compute_health()` returns no percentage when
+the motor is stopped or E-stopped (there is no vibration to assess, and "100%"
+would describe bearings nobody measured), and returns `NO VIBRATION DATA` rather
+than a perfect score when a running motor's sensor sends nothing. Missing values
+are never zero-filled into a score or a gauge. Colour and the Overview's "needs
+attention" count come from the returned `severity`, never from matching label
+text; the vocabulary lives in `pdm-frontend/src/lib/status.js`.
 
 **Online/offline is data recency, not reachability.** A machine is online when
 its newest row is within `ONLINE_WINDOW_SECONDS`. `run_state` separates
@@ -280,8 +297,8 @@ is a separate question answered by `POST /api/connectivity/test`.
 - **`mosquitto` crash-loops on a fresh clone.** `mosquitto/` is gitignored, so
   `mosquitto/config/mosquitto.conf` is absent and the `eclipse-mosquitto` image
   exits on startup (`Unable to open config file`). Create the file — see
-  "Setup on a fresh clone". MQTT is not on the acquisition path, so the rest of
-  the stack runs fine meanwhile.
+  "Setup on a fresh clone". This local broker is not on the acquisition path, so
+  the rest of the stack runs fine meanwhile.
 - **The API refuses to send the InfluxDB token in cleartext.** `INFLUX_URL` must
   be `https://` for any host with a dot in its name; a single-label host
   (`influxdb`, `localhost`) is a container or loopback and is allowed over http,
@@ -329,15 +346,28 @@ is a separate question answered by `POST /api/connectivity/test`.
   (InfluxDB keeps them as distinct nanosecond rows) but it inflates the file
   count above and multiplies MQTT traffic — fix the join when the flow is open
   in the editor and node throughput is visible.
-- **SQL aggregates return NaN, and `json.dumps` refuses it.** A windowed
-  `STDDEV` over its first row has one sample and is undefined; on a perfectly
-  flat signal — an idle motor reporting exactly 0.0 — the variance can also land
-  a hair below zero and come back NaN. `moving_avg + std_dev * sigma` is then
-  NaN and `/anomalies` 500s for a machine that is merely stopped, while a demo
-  machine with real variance passes. `_json_safe()` in `run_query()` turns every
-  non-finite float into `None` at the serialization boundary; the two routes
-  that call `client.query` directly scrub their rows the same way. Never fix
-  this by special-casing one query.
+- **A standard deviation over one sample is undefined, and `json.dumps`
+  refuses NaN.** The first row of a rolling window has a single sample, and a
+  perfectly flat signal — an idle motor at exactly 0.0 — has none to speak of.
+  `_rolling_bounds()` returns a null band for those rather than a number, and
+  `_json_safe()`, applied to every value in `_row()`, turns any non-finite float
+  into `None` at the serialization boundary. Never fix this by special-casing
+  one route.
+- **`contains()` is ~400× slower than an equality chain in Flux.** InfluxDB 2.x
+  cannot push `contains(value: r._field, set: [...])` down to its storage index,
+  so it scans every field of the measurement. Measured on the cloud bucket over
+  24 hours for three fields: 47.7 s with `contains()`, 0.12 s with
+  `r._field == "a" or r._field == "b"`. Always build field filters with
+  `_field_match()`. The symptom is routes that slow down as the bucket grows,
+  until they pass the 30 s client timeout and return 502.
+- **`or r.tag == ""` in a filter defeats the tag index the same way.** The
+  untagged-legacy fallback in `machine_filter()` turned a 7-day `last()` from
+  0.18 s into a timeout, which 502'd `/latest` and `/health` and left the
+  Diagnostics page with no gauges and no health card. It is applied to the
+  native schema only.
+- **Pivot after filtering, not before.** The fault table filters each field on
+  its own value and *then* pivots, so only readings that crossed a limit become
+  rows. Pivoting a week of every field first was correct but timed out.
 - **`text-transform: uppercase` maps `µ` to Greek capital Mu.** Chart titles are
   uppercased in CSS, so "Displacement (µm)" rendered as "(ΜM)" — indistinguishable
   from millimetres, a unit error of 1000×. Spell micron units out in words in
@@ -367,10 +397,17 @@ is a separate question answered by `POST /api/connectivity/test`.
 - **`{}` is truthy.** `/latest` returns `{}` when there is no data; guarding
   with `{latest && ...}` renders a wall of zeroed gauges that look like real
   readings. Check `Object.keys(x).length`.
-- **A missing telemetry table raises, it does not return empty.** Route reads
-  through `run_query()`, which turns that specific error into `[]`.
-- **Untagged legacy rows partition separately** in the fleet query and can
-  clobber a machine's newer row. Keep whichever timestamp is later.
+- **In the cloud store a missing measurement is an empty result, not an
+  error.** A wrong bucket or token *does* raise, and `run_flux()` reports it as
+  a 502 rather than swallowing it — a configuration mistake that silently
+  returned no rows used to show every machine OFFLINE with data still arriving.
+- **`last()` runs per field**, so a field that stopped reporting earlier pivots
+  into a second, older row. `_latest_row()` keeps only the newest; the fleet
+  roll-up keeps whichever timestamp is later per machine.
+- **Headless Chrome will not render narrower than about 500 px.** A
+  `--window-size=420,…` screenshot is a crop of a wider layout and looks like
+  horizontal overflow when there is none. To check a phone width, load the page
+  in a fixed-width `<iframe>` and read `scrollWidth` against `clientWidth`.
 - **Recharts generated no ticks** for an explicit epoch-ms domain; ticks are
   computed in `utils/time.js::timeTicks` instead.
 - **Ports are not auto-detected.** Machine-specific remaps go in `.env`, never
@@ -475,3 +512,9 @@ Do not "fix" them.
 `tools/demo_machine.py` writes synthetic telemetry under its own `machine_id`
 (default `demo01`) for showcasing on a bench with no hardware. It is not part of
 the pipeline. Never write synthetic data under a real machine's ID.
+
+It writes to the **local** InfluxDB 3 store, so it shows up in Grafana but
+**not** on the React dashboard, which reads only the cloud bucket — a `demo01`
+machine registered there reads OFFLINE. Making it reach the dashboard would mean
+either writing synthetic rows into the company's production bucket (don't) or
+giving the API a second, local data source.
