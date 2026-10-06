@@ -188,6 +188,9 @@ export function MachinesProvider({ children }) {
   // Only the analytic configuration, so saving limits from the Settings page
   // cannot disturb the machine's identity or its acquisition details.
   const saveMachineConfig = useCallback(async (id, config) => {
+    if (!authConfigured) {
+      return { error: { message: 'Machine settings are stored in Supabase, which is not configured on this deployment.' } }
+    }
     if (!thresholdsColumn) {
       return { error: { message: 'Run supabase/schema.sql to add the thresholds column.' } }
     }

@@ -59,7 +59,7 @@ function UpdatePasswordPage() {
             />
           </label>
 
-          {error && <p className="text-xs text-red-400">{error}</p>}
+          {error && <p className="text-xs text-status-red">{error}</p>}
 
           <button
             type="submit" disabled={busy}

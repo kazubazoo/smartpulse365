@@ -101,6 +101,7 @@ export const DEFAULT_MACHINE_CONFIG = {
     power: 50,
     frequency: 60,
     temperature: 80,
+    rpm: 1800,
   },
 }
 
@@ -198,18 +199,6 @@ export function refreshMs(refreshId) {
 export function idleTimeoutMs(idleTimeoutId) {
   const entry = IDLE_TIMEOUTS.find(t => t.id === idleTimeoutId) ?? IDLE_TIMEOUTS[1]
   return entry.minutes * 60 * 1000
-}
-
-// Analytic parameters shared by /health, /anomalies and /root-cause-history.
-export function thresholdParams(config) {
-  const c = effectiveMachineConfig(config)
-  return {
-    vib_warn: c.vibWarn,
-    vib_critical: c.vibCritical,
-    vib_scale: c.vibScale,
-    temp_warn: c.tempWarn,
-    temp_critical: c.tempCritical,
-  }
 }
 
 export function toQuery(params) {

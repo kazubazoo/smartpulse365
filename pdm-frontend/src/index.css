@@ -17,6 +17,14 @@
 
 body { background: var(--color-bg-deep); }
 
+/* Tailwind v4 dropped the pointer cursor its preflight used to give buttons, so
+   about half the controls here showed an arrow on hover. Restored once, for
+   every button, rather than remembered on each one. */
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']) {
+  cursor: pointer;
+}
+
 /* The @import for the web fonts has to stay above every rule, so anything
    hand-written lives below this line. */
 

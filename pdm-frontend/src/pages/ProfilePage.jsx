@@ -90,8 +90,8 @@ function ProfilePage() {
             />
           </label>
 
-          {error && <p className="text-xs text-red-400">{error}</p>}
-          {done && <p className="text-xs text-emerald-400">Password updated.</p>}
+          {error && <p className="text-xs text-status-red">{error}</p>}
+          {done && <p className="text-xs text-status-green">Password updated.</p>}
 
           <button
             type="submit" disabled={busy}
@@ -105,7 +105,7 @@ function ProfilePage() {
       <Panel title="Session">
         <button
           onClick={signOut}
-          className="text-sm text-slate-300 border border-border-glow rounded-lg px-4 py-2 hover:border-red-500/50 hover:text-red-300 transition-colors"
+          className="text-sm text-slate-300 border border-border-glow rounded-lg px-4 py-2 hover:border-status-red/50 hover:text-status-red transition-colors"
         >
           Sign out
         </button>

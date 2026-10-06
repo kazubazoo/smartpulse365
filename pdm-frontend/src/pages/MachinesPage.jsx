@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useMachines, EMPTY_SOURCE } from '../contexts/machinesStore'
 import { apiPost } from '../lib/api'
+import { authConfigured } from '../lib/supabase'
+import { RUN_STATE_COLOR } from '../lib/status'
 
 const INPUT_CLASS =
   'bg-bg-deep border border-border-glow rounded-lg px-3 py-2 text-sm ' +
@@ -31,7 +33,10 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
   async function testConnection() {
     setTesting(true); setProbe(null)
     try {
-      setProbe(await apiPost('/api/connectivity/test', draft.source ?? {}))
+      // Modbus TCP is the only protocol the probe speaks. A machine saved before
+      // the protocol field was removed may still carry another value, which the
+      // form can no longer change — so it is pinned here.
+      setProbe(await apiPost('/api/connectivity/test', { ...draft.source, protocol: 'modbus-tcp' }))
     } catch (err) {
       setProbe({ reachable: false, responded: false, detail: err.message })
     }
@@ -67,13 +72,13 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
         <Field
           label="Machine ID"
           hint={isNew
-            ? 'Must match the machine_id tag the acquisition flow writes. Cannot be changed later.'
+            ? 'Must exactly match the device ID the PLC publishes (for example MOTOR001), or no data will appear. Cannot be changed later.'
             : 'Fixed — it links this machine to its stored telemetry.'}
         >
           <input
             className={INPUT_CLASS} value={draft.id} required disabled={!isNew}
             onChange={e => set({ id: e.target.value })}
-            placeholder="motor05"
+            placeholder="MOTOR002"
           />
         </Field>
 
@@ -104,29 +109,16 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
 
       <div className="border-t border-border-glow pt-4">
         <h3 className="text-xs tracking-widest uppercase text-slate-400 mb-1">
-          Data source
+          PLC connection
         </h3>
         <p className="text-xs text-slate-500 mb-4">
-          How the acquisition layer reaches this machine. Recorded here as the
-          authoritative definition; enter the same values in the Node-RED flow
-          so the readings arrive tagged with the Machine ID above.
+          Where this machine's PLC sits on the network, so Test connection can
+          check it is reachable over Modbus TCP. This does not start or change
+          data collection — that is configured in the Node-RED flow.
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <Field label="Protocol">
-            <select
-              className={`${INPUT_CLASS} cursor-pointer`}
-              value={draft.source?.protocol ?? 'modbus-tcp'}
-              onChange={e => setSource({ protocol: e.target.value })}
-            >
-              <option value="modbus-tcp">Modbus TCP</option>
-              <option value="modbus-rtu">Modbus RTU</option>
-              <option value="opc-ua">OPC UA</option>
-              <option value="mqtt">MQTT</option>
-            </select>
-          </Field>
-
-          <Field label="Host / address">
+          <Field label="Host / IP address">
             <input
               className={INPUT_CLASS} value={draft.source?.host ?? ''}
               onChange={e => setSource({ host: e.target.value })}
@@ -134,7 +126,7 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
             />
           </Field>
 
-          <Field label="Port">
+          <Field label="Port" hint="Modbus TCP is 502.">
             <input
               type="number" className={INPUT_CLASS} value={draft.source?.port ?? 502}
               onChange={e => setSource({ port: Number(e.target.value) })}
@@ -145,21 +137,6 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
             <input
               type="number" className={INPUT_CLASS} value={draft.source?.unit_id ?? 1}
               onChange={e => setSource({ unit_id: Number(e.target.value) })}
-            />
-          </Field>
-
-          <Field label="Poll interval" hint="Milliseconds between reads.">
-            <input
-              type="number" step={100} className={INPUT_CLASS}
-              value={draft.source?.poll_ms ?? 1000}
-              onChange={e => setSource({ poll_ms: Number(e.target.value) })}
-            />
-          </Field>
-
-          <Field label="Measurement" hint="InfluxDB measurement the readings land in.">
-            <input
-              className={INPUT_CLASS} value={draft.source?.measurement ?? 'motor_metrics'}
-              onChange={e => setSource({ measurement: e.target.value })}
             />
           </Field>
         </div>
@@ -177,10 +154,10 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
             <div
               className={`flex-1 min-w-[16rem] rounded-lg px-3 py-2 border text-xs ${
                 probe.responded
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                  ? 'bg-status-green/10 border-status-green/30 text-status-green'
                   : probe.reachable
-                    ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
-                    : 'bg-red-500/10 border-red-500/30 text-red-200'
+                    ? 'bg-status-amber/10 border-status-amber/30 text-status-amber'
+                    : 'bg-status-red/10 border-status-red/30 text-status-red'
               }`}
             >
               <p className="font-body tracking-wide mb-0.5">
@@ -198,7 +175,7 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
         </div>
       </div>
 
-      {error && <p className="text-xs text-red-400 mt-4">{error}</p>}
+      {error && <p className="text-xs text-status-red mt-4">{error}</p>}
 
       <div className="flex items-center gap-3 mt-5">
         <button
@@ -216,7 +193,7 @@ function MachineForm({ initial, isNew, onSave, onCancel, onDelete }) {
         {!isNew && (
           <button
             type="button" onClick={() => onDelete(initial.id)}
-            className="ml-auto text-sm text-slate-400 border border-border-glow rounded-lg px-4 py-2 hover:border-red-500/50 hover:text-red-300 transition-colors"
+            className="ml-auto text-sm text-slate-400 border border-border-glow rounded-lg px-4 py-2 hover:border-status-red/50 hover:text-status-red transition-colors"
           >
             Remove
           </button>
@@ -235,14 +212,23 @@ function MachinesPage() {
     return (
       <div>
         <h1 className="font-display text-slate-50 text-xl mb-4">Machines</h1>
-        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-5 max-w-2xl">
-          <p className="text-sm text-amber-200 mb-2">Machine registry not available</p>
-          <p className="text-xs text-slate-400">
-            The <span className="font-mono">machines</span> table has not been created yet.
-            Run <span className="font-mono">supabase/schema.sql</span> in the Supabase SQL
-            Editor, then reload. Until then the dashboard falls back to the machine list
-            configured on the server.
-          </p>
+        <div className="bg-status-amber/10 border border-status-amber/30 rounded-xl p-5 max-w-2xl">
+          <p className="text-sm text-status-amber mb-2">Machine registry not available</p>
+          {authConfigured ? (
+            <p className="text-xs text-slate-400">
+              The <span className="font-mono">machines</span> table has not been created yet.
+              Run <span className="font-mono">supabase/schema.sql</span> in the Supabase SQL
+              Editor, then reload. Until then the dashboard falls back to the machine list
+              configured on the server.
+            </p>
+          ) : (
+            <p className="text-xs text-slate-400">
+              Machines are managed in Supabase, which is not configured on this
+              deployment. The dashboard is showing the machine list configured on the
+              server instead — the <span className="font-mono">MACHINES</span> setting in{' '}
+              <span className="font-mono">.env</span>.
+            </p>
+          )}
         </div>
       </div>
     )
@@ -285,7 +271,7 @@ function MachinesPage() {
       )}
 
       {confirming && (
-        <p className="text-xs text-amber-300 mb-4">
+        <p className="text-xs text-status-amber mb-4">
           Press Remove again to delete <span className="font-mono">{confirming}</span>.
           Stored telemetry is not deleted.
         </p>
@@ -309,7 +295,10 @@ function MachinesPage() {
             </div>
 
             <div className="flex items-center gap-4">
-              <span className="text-[11px] tracking-widest uppercase text-slate-500">
+              <span
+                className="text-[11px] tracking-widest uppercase"
+                style={{ color: RUN_STATE_COLOR[m.run_state ?? 'OFFLINE'] ?? RUN_STATE_COLOR.UNKNOWN }}
+              >
                 {m.run_state ?? 'OFFLINE'}
               </span>
               <button

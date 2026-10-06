@@ -165,8 +165,10 @@ function DisplaySettings() {
   const [justSaved, flashSaved] = useSavedFlash()
   const [error, setError] = useState(null)
 
+  // Order-independent, like the machine form: these settings round-trip through
+  // Postgres jsonb, which does not preserve key order.
   const dirty = useMemo(
-    () => JSON.stringify(draft) !== JSON.stringify(settings),
+    () => stableStringify(draft) !== stableStringify(settings),
     [draft, settings],
   )
 
@@ -183,7 +185,7 @@ function DisplaySettings() {
     <>
       <Panel
         title="Default view"
-        hint="What the dashboard opens with. The pickers at the top of each page override this for the current session."
+        hint="What the dashboard opens with. Changing the time range or refresh picker on the Diagnostics page updates these too."
         columns={3}
       >
         <Field label="Time range">
@@ -351,7 +353,15 @@ function MachineConfigForm({
 
   return (
     <>
-      {!thresholdsColumn && (
+      {/* Two different reasons a machine's settings cannot be saved, and they
+          need different fixes — so they get different messages. */}
+      {!authConfigured ? (
+        <div className="mb-4 rounded-lg border border-status-amber/40 bg-status-amber/10 px-4 py-3 text-xs text-status-amber">
+          Machine settings are stored in Supabase, which is not configured on this
+          deployment, so changes here cannot be saved and every machine uses the
+          default limits.
+        </div>
+      ) : !thresholdsColumn && (
         <div className="mb-4 rounded-lg border border-status-amber/40 bg-status-amber/10 px-4 py-3 text-xs text-status-amber">
           The machine registry has no <span className="font-mono">thresholds</span> column yet.
           Re-run <span className="font-mono">supabase/schema.sql</span> in the Supabase SQL editor
@@ -524,6 +534,7 @@ function MachineConfigForm({
         <Slider label="Power" value={draft.gauges.power} onChange={v => setGauge('power', v)} min={1} max={1000} step={1} unit="kW" />
         <Slider label="Frequency" value={draft.gauges.frequency} onChange={v => setGauge('frequency', v)} min={10} max={400} step={5} unit="Hz" />
         <Slider label="Temperature" value={draft.gauges.temperature} onChange={v => setGauge('temperature', v)} min={40} max={250} step={5} unit="°C" />
+        <Slider label="Speed" value={draft.gauges.rpm} onChange={v => setGauge('rpm', Math.round(v))} min={100} max={6000} step={50} unit="rpm" />
       </Panel>
 
       <div className="flex justify-end">

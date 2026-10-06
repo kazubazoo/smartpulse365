@@ -138,10 +138,10 @@ function TimeSeriesChart({
             <Line
               key={s.name}
               {...(dualAxis ? { yAxisId: s.axis } : {})}
-              // Diagnosis codes hold a value until the sensor reports a
-              // different one; sloping between two codes would draw values the
-              // sensor never emitted.
-              type={s.step ? 'stepAfter' : 'monotone'}
+              // Continuous measurements only. Categorical data such as the
+              // fault diagnosis codes belongs in FaultCodeTimeline, where no
+              // value is interpolated between two readings.
+              type="monotone"
               dataKey={s.name}
               stroke={s.color}
               strokeWidth={s.width ?? 2}

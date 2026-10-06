@@ -16,7 +16,6 @@ import { useSettings } from './contexts/settingsStore'
 import { useMachines } from './contexts/machinesStore'
 import { useIdleLogout } from './hooks/useIdleLogout'
 import { idleTimeoutMs } from './lib/defaults'
-import './index.css'
 
 const PAGES = ['overview', 'diagnostics', 'machines', 'settings', 'profile']
 
@@ -56,6 +55,10 @@ function useHashRoute() {
 function Dashboard() {
   const [route, navigate] = useHashRoute()
   const { machines, loading } = useMachines()
+  const { authConfigured } = useAuth()
+  // Profile only exists when there is an account; a pasted #/profile link on a
+  // deployment without Supabase lands on the Overview instead.
+  const page = route.page === 'profile' && !authConfigured ? 'overview' : route.page
 
   // Derived, not synced: the selection falls back to the first machine while
   // the fleet loads, and recovers on its own if the chosen one is removed.
@@ -65,7 +68,6 @@ function Dashboard() {
       : machines[0]?.id ?? null
 
   const openMachine = useCallback(id => navigate('diagnostics', id), [navigate])
-  const selectMachine = useCallback(id => navigate('diagnostics', id), [navigate])
   const goTo = useCallback(page => {
     navigate(page, page === 'diagnostics' ? selectedMachine : null)
   }, [navigate, selectedMachine])
@@ -79,25 +81,27 @@ function Dashboard() {
   }, [route.page, route.machine, selectedMachine])
 
   return (
-    <div className="flex min-h-screen bg-bg-deep font-body">
-      <Sidebar activePage={route.page} onNavigate={goTo} />
-      <main className="flex-1 p-8 min-w-0">
-        {route.page === 'overview' && (
+    // Side-by-side from md up; below that the sidebar becomes a bar across the
+    // top, so a tablet or phone gets the full width for charts.
+    <div className="flex flex-col md:flex-row min-h-screen bg-bg-deep font-body">
+      <Sidebar activePage={page} onNavigate={goTo} />
+      <main className="flex-1 p-4 md:p-8 min-w-0">
+        {page === 'overview' && (
           <OverviewPage machines={machines} loading={loading} onOpenMachine={openMachine} />
         )}
-        {route.page === 'diagnostics' && (
+        {page === 'diagnostics' && (
           // Remounting on machine change resets every series and cursor, so
           // one machine's data can never bleed into another's charts.
           <DiagnosticsPage
             key={selectedMachine}
             machines={machines}
             machineId={selectedMachine}
-            onSelectMachine={selectMachine}
+            onSelectMachine={openMachine}
           />
         )}
-        {route.page === 'machines' && <MachinesPage />}
-        {route.page === 'settings' && <SettingsPage />}
-        {route.page === 'profile' && <ProfilePage />}
+        {page === 'machines' && <MachinesPage />}
+        {page === 'settings' && <SettingsPage />}
+        {page === 'profile' && <ProfilePage />}
       </main>
     </div>
   )

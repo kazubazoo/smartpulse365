@@ -1,20 +1,5 @@
 import { memo } from 'react'
-
-// OFFLINE means nothing is arriving from the machine; IDLE means data is
-// flowing and the motor is simply stopped. Keeping them distinct stops a dead
-// sensor from being mistaken for a machine that is deliberately switched off.
-const STATE_COLOR = {
-  RUNNING: '#34D399',
-  IDLE: '#38BDF8',
-  'E-STOP': '#F87171',
-  OFFLINE: '#64748B',
-  UNKNOWN: '#64748B',
-}
-
-function healthColor(pct) {
-  if (pct === null || pct === undefined) return '#64748B'
-  return pct >= 75 ? '#34D399' : pct >= 50 ? '#FBBF24' : '#F87171'
-}
+import { RUN_STATE_COLOR, severityColor } from '../lib/status'
 
 function relativeAge(seconds) {
   if (seconds === null || seconds === undefined) return 'never reported'
@@ -40,11 +25,14 @@ function Metric({ label, value, unit, decimals = 1 }) {
 }
 
 function MachineCard({ machine, onOpen }) {
-  const { name, online, health_percent, status_label } = machine
+  const { name, online, health_percent, status_label, severity } = machine
   const state = machine.run_state ?? (online ? 'UNKNOWN' : 'OFFLINE')
-  const hc = healthColor(health_percent)
-  const dot = STATE_COLOR[state] ?? '#64748B'
+  const hc = severityColor(severity)
+  const dot = RUN_STATE_COLOR[state] ?? RUN_STATE_COLOR.UNKNOWN
   const anomalies = machine.anomaly_count ?? 0
+  // No percentage while the motor is stopped or vibration data is missing —
+  // see compute_health() in pdm-backend/main.py.
+  const scored = health_percent !== null && health_percent !== undefined
 
   return (
     <button
@@ -75,16 +63,21 @@ function MachineCard({ machine, onOpen }) {
           <div className="mb-4">
             <div className="flex items-baseline justify-between mb-1.5">
               <span className="text-xs" style={{ color: hc }}>{status_label}</span>
-              <span className="font-display text-sm" style={{ color: hc }}>
-                {health_percent}%
-              </span>
+              {scored && (
+                <span className="font-display text-sm" style={{ color: hc }}>
+                  {health_percent}%
+                </span>
+              )}
             </div>
-            <div className="h-1.5 rounded-full bg-bg-deep overflow-hidden">
-              <div
-                className="h-full rounded-full transition-all duration-500"
-                style={{ width: `${health_percent ?? 0}%`, background: hc }}
-              />
-            </div>
+            {/* No bar at all when unscored: an empty track reads as 0%. */}
+            {scored && (
+              <div className="h-1.5 rounded-full bg-bg-deep overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{ width: `${health_percent}%`, background: hc }}
+                />
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-3 gap-3">

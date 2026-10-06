@@ -165,8 +165,8 @@ function LoginPage() {
               />
             </label>
 
-            {error && <p className="text-xs text-red-400">{error}</p>}
-            {notice && <p className="text-xs text-emerald-400">{notice}</p>}
+            {error && <p className="text-xs text-status-red">{error}</p>}
+            {notice && <p className="text-xs text-status-green">{notice}</p>}
 
             <button
               type="submit" disabled={busy}
@@ -228,8 +228,8 @@ function LoginPage() {
               />
             </label>
 
-            {error && <p className="text-xs text-red-400">{error}</p>}
-            {notice && <p className="text-xs text-emerald-400">{notice}</p>}
+            {error && <p className="text-xs text-status-red">{error}</p>}
+            {notice && <p className="text-xs text-status-green">{notice}</p>}
 
             <button
               type="submit" disabled={busy}
@@ -255,8 +255,8 @@ function LoginPage() {
               />
             </label>
 
-            {error && <p className="text-xs text-red-400">{error}</p>}
-            {notice && <p className="text-xs text-emerald-400">{notice}</p>}
+            {error && <p className="text-xs text-status-red">{error}</p>}
+            {notice && <p className="text-xs text-status-green">{notice}</p>}
 
             <button
               type="submit" disabled={busy}
