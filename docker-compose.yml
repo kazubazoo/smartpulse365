@@ -116,19 +116,23 @@ services:
       # The dashboard reads telemetry from the company's InfluxDB 2.x server.
       # Writes are not ours: Node-RED publishes to the Novaflow MQTT broker and
       # their ingest lands the data in this bucket, so the API only ever reads.
-      INFLUX_URL: ${INFLUX_URL:-http://influxdb:8086}
+      # Blank means "use the default in main.py", which is the production
+      # deployment. Only the token has no default and must be set in .env.
+      INFLUX_URL: ${INFLUX_URL:-}
       INFLUX_TOKEN: ${INFLUX_TOKEN:-}
       INFLUX_ORG: ${INFLUX_ORG:-}
-      INFLUX_BUCKET: ${INFLUX_BUCKET:-machine_telemetry}
-      INFLUX_MEASUREMENT: ${INFLUX_MEASUREMENT:-motor_metrics}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-}
+      INFLUX_MEASUREMENT: ${INFLUX_MEASUREMENT:-}
       INFLUX_ALLOW_INSECURE: ${INFLUX_ALLOW_INSECURE:-}
       # Blank disables auth enforcement; set both to require a Supabase session.
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
       # Assets this deployment monitors, as "id:Display Name" pairs. Listed
       # machines stay visible when they stop reporting, shown as offline.
-      MACHINES: ${MACHINES:-motor01:Motor 01}
-      ONLINE_WINDOW_SECONDS: ${ONLINE_WINDOW_SECONDS:-30}
+      MACHINES: ${MACHINES:-}
+      DEFAULT_MACHINE_ID: ${DEFAULT_MACHINE_ID:-}
+      ONLINE_WINDOW_SECONDS: ${ONLINE_WINDOW_SECONDS:-}
+      ANOMALY_WINDOW_SECONDS: ${ANOMALY_WINDOW_SECONDS:-}
       TZ: "Asia/Kuala_Lumpur"
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     volumes:

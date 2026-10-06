@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-"""Optional demo machine — synthetic telemetry for showcasing the dashboard.
+"""Optional demo machine — synthetic telemetry with no hardware attached.
 
-This is NOT part of the production pipeline. Real readings come from the PLC via
-Node-RED. Use this only when you need a machine that visibly does something
-during a demo, on a bench with no hardware attached.
+This is NOT part of the production pipeline. Real readings come from the PLC,
+through Node-RED and the Novaflow MQTT broker, into the cloud InfluxDB.
+
+IMPORTANT — where this data goes, and where it does not:
+
+    It writes to the LOCAL InfluxDB 3 container (port 8181), in the native
+    schema (measurement motor_metrics, tag machine_id). That store is read by
+    Grafana, so the demo machine shows up there.
+
+    It does NOT reach the React dashboard. The dashboard reads only the cloud
+    InfluxDB, in the MQTT guideline schema, and this project never writes to
+    the cloud. A "demo01" machine registered in the dashboard will therefore
+    show as OFFLINE.
 
 Everything it writes is tagged with a machine_id of its own (default "demo01"),
 so it can never be mistaken for, or mixed into, a real machine's history.
 
-    # Stream live at 1 Hz until Ctrl+C (machine shows as RUNNING / online)
-    python github/tools/demo_machine.py stream
+    # Stream live at 1 Hz until Ctrl+C
+    python tools/demo_machine.py stream
 
     # Backfill 6 hours of history so the long time ranges have something to show
-    python github/tools/demo_machine.py backfill --hours 6
+    python tools/demo_machine.py backfill --hours 6
 
     # Remove everything this script ever wrote
-    python github/tools/demo_machine.py purge
+    python tools/demo_machine.py purge
 
-Register a machine in the dashboard with a Machine ID matching --machine-id for
-it to appear on the Overview.
+Reads INFLUXDB3_AUTH_TOKEN from the environment or from .env in the repo root.
 """
 import argparse
 import math

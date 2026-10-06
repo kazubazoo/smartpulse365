@@ -44,16 +44,21 @@ app.add_middleware(
 #     and fault classification are therefore computed in Python here, which
 #     also keeps the threshold values out of the query text entirely.
 # --------------------------------------------------------------------------
-INFLUX_URL = os.environ.get("INFLUX_URL", "http://influxdb:8086").rstrip("/")
-INFLUX_ORG = os.environ.get("INFLUX_ORG", "")
-INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "machine_telemetry")
-MEASUREMENT = os.environ.get("INFLUX_MEASUREMENT", "motor_metrics")
+# Defaults are the production deployment, and live here only. `or` rather than
+# a get() default, because docker-compose passes an unset variable through as an
+# empty string, which get() would happily return.
+INFLUX_URL = (os.environ.get("INFLUX_URL") or "http://sm365db.novaplus.my:8086").rstrip("/")
+INFLUX_ORG = os.environ.get("INFLUX_ORG") or "Novaflow"
+INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET") or "PREDICTIVE_MAINTAINANCE_MODULE"
+# The measurement Novaflow's ingest writes into. It is the payload's
+# device_type, which the flow sets to "MOTOR".
+MEASUREMENT = os.environ.get("INFLUX_MEASUREMENT") or "MOTOR"
 
 # How far back a route reaches when the caller did not bound the window
 # itself: the fleet roll-up's "latest reading per machine", a single /latest,
 # and an unbounded fault table. Flux requires a range, so "everything" has to
 # become a number somewhere.
-MAX_LOOKBACK = os.environ.get("INFLUX_MAX_LOOKBACK", "7d")
+MAX_LOOKBACK = os.environ.get("INFLUX_MAX_LOOKBACK") or "7d"
 
 
 # --------------------------------------------------------------------------
@@ -88,7 +93,7 @@ INSECURE_TRANSPORT = _transport_warning(INFLUX_URL)
 
 _influx = InfluxDBClient(
     url=INFLUX_URL,
-    token=os.environ.get("INFLUX_TOKEN", ""),
+    token=os.environ.get("INFLUX_TOKEN") or "",
     org=INFLUX_ORG,
     timeout=30_000,
     # Certificate verification stays on. Turning it off would accept any
@@ -107,13 +112,13 @@ _query_api = _influx.query_api()
 # the operator sees that it went offline rather than it silently vanishing.
 # Anything discovered in the data but not configured is appended automatically.
 # --------------------------------------------------------------------------
-DEFAULT_MACHINE = os.environ.get("DEFAULT_MACHINE_ID", "motor01")
-ONLINE_WINDOW_SECONDS = int(os.environ.get("ONLINE_WINDOW_SECONDS", "30"))
+DEFAULT_MACHINE = os.environ.get("DEFAULT_MACHINE_ID") or "MOTOR001"
+ONLINE_WINDOW_SECONDS = int(os.environ.get("ONLINE_WINDOW_SECONDS") or "30")
 MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _parse_machines() -> dict[str, str]:
-    raw = os.environ.get("MACHINES", f"{DEFAULT_MACHINE}:Motor 01")
+    raw = os.environ.get("MACHINES") or f"{DEFAULT_MACHINE}:Motor 01"
     out: dict[str, str] = {}
     for part in raw.split(","):
         part = part.strip()
@@ -183,10 +188,18 @@ def machine_filter(machine_id: str) -> str:
 
     Returns an empty string when nothing has ever written the tag, since
     filtering on a tag key that does not exist would match nothing at all.
+
+    The untagged fallback is applied to the native schema only. Every row in the
+    cloud bucket carries device_id — it is part of every MQTT payload — so
+    there are no legacy rows there to rescue, and the `or` costs far more than
+    it looks: it stops InfluxDB using its tag index, so a 7-day last() becomes a
+    full scan. Measured against the cloud bucket: 0.18 s with the plain filter,
+    over 60 s (timed out) with the fallback. /latest and /health hit that and
+    returned 502, which left the Diagnostics page with no gauges and no health.
     """
     if not _has_machine_tag():
         return ""
-    if machine_id == DEFAULT_MACHINE:
+    if machine_id == DEFAULT_MACHINE and not GUIDELINE_SCHEMA:
         return (f'  |> filter(fn: (r) => r["{MACHINE_TAG}"] == "{machine_id}" '
                 f'or r["{MACHINE_TAG}"] == "")\n')
     return f'  |> filter(fn: (r) => r["{MACHINE_TAG}"] == "{machine_id}")\n'
@@ -321,15 +334,15 @@ GUIDELINE_FIELDS = {
 
 # "guideline" for the cloud bucket; "native" to read a store written directly
 # by the flow's InfluxDB node, where the names and units are already correct.
-GUIDELINE_SCHEMA = os.environ.get("INFLUX_SCHEMA", "guideline").lower() == "guideline"
+GUIDELINE_SCHEMA = (os.environ.get("INFLUX_SCHEMA") or "guideline").lower() == "guideline"
 
 # The guideline payload identifies the asset as `device_id` (and the flow sends
 # "MOTOR001"), where the native schema tags rows `machine_id`. Whichever it is,
 # rows come out of here keyed on `machine_id`, so nothing downstream has to care
 # — but the id itself must still match the machine registry, or the join fails
 # and the machine shows no data.
-MACHINE_TAG = os.environ.get(
-    "INFLUX_MACHINE_TAG", "device_id" if GUIDELINE_SCHEMA else "machine_id"
+MACHINE_TAG = os.environ.get("INFLUX_MACHINE_TAG") or (
+    "device_id" if GUIDELINE_SCHEMA else "machine_id"
 )
 
 _SOURCE_OF = {name: src for name, (src, _) in GUIDELINE_FIELDS.items()}
@@ -395,49 +408,117 @@ def _bucket_seconds(seconds: int, max_points: int) -> int:
     return max(2, -(-seconds // max_points))
 
 
+# Motor states reported in status_code (PLC register D210).
+STATUS_ESTOP, STATUS_IDLE, STATUS_RUNNING = 0, 1, 2
+
+
 def compute_health(row, t: Thresholds):
-    vx = row.get("vibration_x") or 0
-    vy = row.get("vibration_y") or 0
-    vz = row.get("vibration_z") or 0
-    temp = row.get("temperature") or 0
-    peak = max(vx, vy, vz)
+    """Score one reading against the machine's alarm limits.
 
-    health_percent = max(0, min(100, round(100 - (peak / t.vib_scale * 100))))
+    Returns a health percentage, a short status label, a one-line explanation,
+    and a `severity` the dashboard colours and counts by:
+
+        ok | idle | watch | warning | critical | unknown
+
+    Two cases are deliberately *not* scored. A stopped motor produces no
+    vibration, and calling that "100% healthy" would say something about the
+    bearings that nobody measured — so a stopped motor is reported as stopped,
+    with no percentage. And a running motor whose vibration sensor sent nothing
+    is reported as missing data rather than as zero vibration, because a
+    fabricated zero reads as "measured and perfectly smooth" and would hide a
+    dead sensor behind a perfect score.
+
+    Temperature is checked whatever the motor is doing: one that has just been
+    stopped can still be overheating.
+    """
+    vx, vy, vz = (row.get(axis) for axis in _VIB_AXES)
+    readings = [v for v in (vx, vy, vz) if v is not None]
+    peak = max(readings) if readings else None
+
+    temp = row.get("temperature")
+    code = row.get("status_code")
+    code = int(code) if code is not None else None
+
+    def result(label, severity, commentary, percent=None):
+        return {
+            "health_percent": percent,
+            "status_label": label,
+            "severity": severity,
+            "commentary": commentary,
+            "peak_vibration": peak,
+        }
+
+    if temp is not None and temp > t.temp_critical:
+        return result(
+            "CRITICAL: OVERHEAT", "critical",
+            "Motor temperature is above the critical limit. High risk of bearing "
+            "lubricant breakdown — check the cooling fan.",
+        )
+
+    warm = temp is not None and temp > t.temp_warn
+
+    if code == STATUS_ESTOP:
+        return result(
+            "E-STOP ENGAGED", "warning",
+            "The emergency stop is engaged. Vibration health is assessed while "
+            "the motor is running.",
+        )
+    if code == STATUS_IDLE:
+        if warm:
+            return result(
+                "WATCH: Elevated Temperature", "watch",
+                "The motor is stopped but still warmer than its normal band.",
+            )
+        return result(
+            "MOTOR STOPPED", "idle",
+            "The motor is not running, so there is no vibration to assess. "
+            "Temperature is still being monitored.",
+        )
+
+    if not readings:
+        return result(
+            "NO VIBRATION DATA", "unknown",
+            "The vibration sensor sent no reading. Check the sensor and its "
+            "RS-485 connection to the PLC.",
+        )
+
+    # From here the motor is running (or its state is unreported) and at least
+    # one axis has a real reading. Missing axes are left out of the comparison
+    # rather than counted as zero.
+    vx = vx if vx is not None else float("-inf")
+    vy = vy if vy is not None else float("-inf")
+    vz = vz if vz is not None else float("-inf")
+
+    percent = max(0, min(100, round(100 - (peak / t.vib_scale * 100))))
     severe = t.vib_warn + (t.vib_critical - t.vib_warn) * 0.25
+    beyond_critical = peak > t.vib_critical
 
-    if temp > t.temp_critical:
-        status_label = "CRITICAL: OVERHEAT"
-    elif vz > t.vib_warn:
-        status_label = "ALARM: Axial Misalignment"
+    if vz > t.vib_warn:
+        label, severity = "ALARM: Axial Misalignment", "warning"
     elif vx > t.vib_warn or vy > t.vib_warn:
-        status_label = "WARNING: Radial Unbalance/Looseness"
-    elif temp > t.temp_warn:
-        status_label = "WATCH: Elevated Temperature"
+        label, severity = "WARNING: Radial Unbalance/Looseness", "warning"
+    elif warm:
+        label, severity = "WATCH: Elevated Temperature", "watch"
     else:
-        status_label = "SYSTEM OPTIMAL"
+        label, severity = "SYSTEM OPTIMAL", "ok"
+    if beyond_critical:
+        severity = "critical"
 
     if vy > severe and vy > vx:
-        commentary = ("Vertical looseness detected. High Y-axis energy suggests loose "
-                      "mounting bolts or a soft-foot condition.")
-    elif temp > t.temp_critical:
-        commentary = ("Thermal overload detected. High risk of bearing lubricant "
-                      "breakdown. Check the cooling fan.")
+        commentary = ("Vertical looseness detected. High Y-axis energy suggests "
+                      "loose mounting bolts or a soft-foot condition.")
     elif vz > vx and vz > vy and vz > severe:
-        commentary = ("Axial vibration is dominant, suggesting coupling misalignment "
-                      "or thrust bearing wear.")
+        commentary = ("Axial vibration is dominant, suggesting coupling "
+                      "misalignment or thrust bearing wear.")
     elif vx > severe or vy > severe:
-        commentary = ("Radial vibration detected. Likely cause: rotor unbalance or "
-                      "loose mounting bolts.")
+        commentary = ("Radial vibration detected. Likely cause: rotor unbalance "
+                      "or loose mounting bolts.")
+    elif warm:
+        commentary = "Vibration is normal, but the motor is running warmer than usual."
     else:
-        commentary = ("Vibration signatures are harmonized. Motor is within "
-                      "ISO 10816-3 Zone A (Optimal).")
+        commentary = "Vibration is below the warning limit on every axis."
 
-    return {
-        "health_percent": health_percent,
-        "status_label": status_label,
-        "ai_commentary": commentary,
-        "peak_vibration": peak,
-    }
+    return result(label, severity, commentary, percent)
 
 
 def _json_safe(value):
@@ -528,9 +609,19 @@ def run_flux(flux: str) -> list[dict]:
     return [_row(rec.values) for table in tables for rec in table.records]
 
 
+def _field_match(fields: list[str]) -> str:
+    """A Flux predicate matching any of `fields`, as a chain of equalities.
+
+    Never contains(): InfluxDB cannot push it down to its storage index, so it
+    scans every field of the measurement and discards the rest. Measured on the
+    cloud bucket over 24 hours for three fields: 47.7 s with contains(), 0.12 s
+    with this chain. Every route that selects fields goes through here.
+    """
+    return " or ".join(f'r._field == "{f}"' for f in fields)
+
+
 def _field_filter(fields: list[str]) -> str:
-    names = ", ".join(f'"{f}"' for f in _source_fields(fields))
-    return f'  |> filter(fn: (r) => contains(value: r._field, set: [{names}]))\n'
+    return f'  |> filter(fn: (r) => {_field_match(_source_fields(fields))})\n'
 
 
 def _stream(start: str, machine_id: Optional[str] = None,
@@ -612,7 +703,7 @@ def service_health():
     }
 
 
-ANOMALY_WINDOW_SECONDS = int(os.environ.get("ANOMALY_WINDOW_SECONDS", "3600"))
+ANOMALY_WINDOW_SECONDS = int(os.environ.get("ANOMALY_WINDOW_SECONDS") or "3600")
 
 
 def _run_state(online: bool, status_code) -> str:
@@ -760,6 +851,7 @@ def list_machines(
             "status_code": None,
             "health_percent": None,
             "status_label": None,
+            "severity": None,
             "peak_vibration": None,
             "temperature": None,
             "frequency": None,
@@ -786,6 +878,7 @@ def list_machines(
                 "status_code": row.get("status_code"),
                 "health_percent": health["health_percent"],
                 "status_label": health["status_label"],
+                "severity": health["severity"],
                 "peak_vibration": health["peak_vibration"],
                 "temperature": row.get("temperature"),
                 "frequency": row.get("frequency"),
@@ -923,28 +1016,33 @@ def root_cause_history(machine_id: str, limit: int = 10, seconds: int = 0,
     # MAX_LOOKBACK. Faults older than that are not reachable from this route.
     start = f"-{min(seconds, 7 * 24 * 3600)}s" if seconds > 0 else f"-{MAX_LOOKBACK}"
 
-    # The exceedance test runs server-side so only the handful of rows that
-    # actually tripped a limit cross the network — a seven-day window is far too
-    # much to pull back and sift here. That means comparing against the *stored*
-    # column names and the *stored* scale, which is what _source_name and
-    # _source_limit supply; the values are cast to float first because Flux
-    # refuses to compare an integer column against a float literal.
+    # The exceedance test runs server-side, and runs on each field's own value
+    # *before* the pivot, so only the readings that actually crossed a limit are
+    # ever joined into rows. Pivoting the whole window first and filtering
+    # afterwards was correct but scaled with history: over seven days it ran
+    # past the 30 s client timeout and the "All history" scope returned 502.
+    # Filtering first takes about 5 s over the same week.
     #
-    # Classification stays in Python, on the un-scaled values: Flux has no CASE,
-    # and this keeps one copy of the cascade rather than a second one in Flux
-    # that could drift away from it.
-    vx_s, vy_s, vz_s = (_source_name(a) for a in _VIB_AXES)
+    # The comparison is against the *stored* names and scale (_source_name,
+    # _source_limit), with values cast to float because Flux will not compare an
+    # integer column against a float literal.
+    #
+    # Rows that come out carry only the fields that crossed. That is enough to
+    # classify them: every rule below tests a field against a limit at or above
+    # its pre-filter threshold, so a field that did not cross cannot change the
+    # result, and it reads as 0. Classification stays in Python, on un-scaled
+    # values — Flux has no CASE, and one copy of the cascade cannot drift.
+    vib_fields = [_source_name(a) for a in _VIB_AXES]
     temp_s = _source_name("temperature")
-    vib_limit = _source_limit("vibration_x", warn)
-    temp_limit = _source_limit("temperature", tw)
+    vib_limit = float(_source_limit("vibration_x", warn))
+    temp_limit = float(_source_limit("temperature", tw))
 
     flux = (_stream(start, machine_id, _VIB_AXES + ["temperature"])
             + '  |> map(fn: (r) => ({ r with _value: float(v: r._value) }))\n'
+            + f'  |> filter(fn: (r) => (r._field == "{temp_s}" and r._value > {temp_limit!r}) '
+              f'or (({_field_match(vib_fields)}) and r._value > {vib_limit!r}))\n'
             + _PIVOT
-            + f'  |> filter(fn: (r) => r["{vx_s}"] > {float(vib_limit)!r} '
-              f'or r["{vy_s}"] > {float(vib_limit)!r} '
-              f'or r["{vz_s}"] > {float(vib_limit)!r} '
-              f'or r["{temp_s}"] > {float(temp_limit)!r})\n'
+            + '  |> group()\n'
             + '  |> sort(columns: ["_time"], desc: true)\n'
             + f'  |> limit(n: {limit})\n')
 
@@ -1074,11 +1172,14 @@ def test_connectivity(payload: dict = Body(...), user=Depends(require_user)):
     if not 1 <= port <= 65535:
         raise HTTPException(status_code=400, detail="Port must be between 1 and 65535")
 
+    # Only Modbus TCP can be probed. Anything else is refused outright rather
+    # than sent a Modbus read, which would report a meaningless result as if it
+    # were a real test of that protocol.
     protocol = str(payload.get("protocol") or "modbus-tcp")
-    if protocol not in ("modbus-tcp", "mqtt", "opc-ua"):
+    if protocol != "modbus-tcp":
         return {
-            "reachable": False, "responded": False,
-            "detail": f"Live testing is not implemented for {protocol}.",
+            "reachable": False, "responded": False, "protocol": protocol,
+            "detail": f"Connection testing is only available for Modbus TCP, not {protocol}.",
         }
 
     result = _modbus_probe(host, port, unit_id)

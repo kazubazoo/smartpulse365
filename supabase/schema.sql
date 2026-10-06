@@ -2,7 +2,9 @@
 -- Safe to re-run: every statement is idempotent.
 
 -- ---------------------------------------------------------------------------
--- Per-user dashboard settings (thresholds, time range, gauge ranges)
+-- Per-user display preferences (time range, refresh rate, chart resolution,
+-- fault-table scope, idle timeout). Alarm limits are NOT here — they belong to
+-- the machine, in machines.thresholds below.
 -- ---------------------------------------------------------------------------
 create table if not exists public.user_settings (
   user_id    uuid primary key references auth.users(id) on delete cascade,
@@ -35,9 +37,9 @@ create policy "update own settings"
 -- Machine registry
 --
 -- Unlike settings, machines describe the plant itself, so every signed-in
--- operator sees the same list. The id is the machine_id tag written into
--- InfluxDB by the acquisition flow — that string is what links a row here to
--- its telemetry.
+-- operator sees the same list. The id is what links a row here to its
+-- telemetry: it must equal the device_id the PLC publishes (MOTOR001), which is
+-- the tag Novaflow's ingest stores it under in the cloud InfluxDB.
 -- ---------------------------------------------------------------------------
 create table if not exists public.machines (
   id          text primary key
@@ -45,8 +47,10 @@ create table if not exists public.machines (
   name        text not null,
   location    text default '',
   notes       text default '',
-  -- Acquisition settings: protocol, host, port, unit id, poll interval,
-  -- measurement name. Held as jsonb so fields can be added without a migration.
+  -- Where the machine's PLC is on the network: host, port and Modbus unit id.
+  -- Used only by the Machines page's "Test connection" button — it does not
+  -- configure acquisition, which is set in the Node-RED flow. jsonb so fields
+  -- can be added without a migration.
   source      jsonb not null default '{}'::jsonb,
   -- Analytic configuration for THIS asset: which vibration standard applies,
   -- the machine details that select the right class within it, the derived
@@ -96,11 +100,15 @@ create policy "delete machines"
   to authenticated
   using (true);
 
--- Seed the machines this deployment already has telemetry for. Existing rows
--- are left untouched so re-running never clobbers edits made in the UI.
+-- Seed the machines this deployment knows about. Existing rows are left
+-- untouched, so re-running never clobbers edits made in the UI.
+--
+--   MOTOR001  The real motor. Its telemetry arrives through the cloud path:
+--             PLC -> Node-RED -> Novaflow MQTT -> cloud InfluxDB -> dashboard.
+--   demo01    Synthetic data from tools/demo_machine.py, for showing the
+--             dashboard with no hardware. See that script before relying on it.
 insert into public.machines (id, name, location, source) values
-  ('motor01', 'Motor 01', 'Demo Kit', '{"protocol":"modbus-tcp","host":"192.168.0.30","port":502,"unit_id":1,"poll_ms":1000,"measurement":"motor_metrics"}'::jsonb),
-  ('motor02', 'Motor 02', 'Demo Kit', '{"protocol":"modbus-tcp","host":"192.168.0.31","port":502,"unit_id":1,"poll_ms":1000,"measurement":"motor_metrics"}'::jsonb),
-  ('motor03', 'Motor 03', 'Demo Kit', '{"protocol":"modbus-tcp","host":"192.168.0.32","port":502,"unit_id":1,"poll_ms":1000,"measurement":"motor_metrics"}'::jsonb),
-  ('motor04', 'Motor 04', 'Demo Kit', '{"protocol":"modbus-tcp","host":"192.168.0.33","port":502,"unit_id":1,"poll_ms":1000,"measurement":"motor_metrics"}'::jsonb)
+  ('MOTOR001', 'Motor 01', 'Demo Kit',
+   '{"protocol":"modbus-tcp","host":"192.168.0.30","port":502,"unit_id":1}'::jsonb),
+  ('demo01', 'Demo Motor', 'Synthetic data', '{}'::jsonb)
 on conflict (id) do nothing;
