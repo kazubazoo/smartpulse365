@@ -65,8 +65,14 @@ address, and click **Deploy**.
 
 **To enable logins:** run `supabase/schema.sql` in the Supabase SQL Editor,
 create a user under *Authentication → Users*, and put the same Supabase URL and
-anon key in both `.env` and `pdm-frontend/.env.local`. Rebuild the frontend
-afterwards — those values are baked in at build time.
+anon key in both `.env` and `pdm-frontend/.env.local`:
+
+- **URL** — *Integrations → Data API → API URL*, without the trailing
+  `/rest/v1/` (just `https://<project>.supabase.co`).
+- **Anon key** — *Project Settings → API Keys → Legacy anon, service_role API
+  keys* → the **anon public** key. Never use the `service_role` key.
+
+Rebuild the frontend afterwards — those values are baked in at build time.
 
 > Always use `npm run build` + `npm run preview`. `npm run dev` leaks memory at
 > this data rate and eventually crashes the browser tab.

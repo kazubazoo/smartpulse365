@@ -296,8 +296,10 @@ says exactly what is wrong (usually the insecure flag).
 2. **Authentication → Users → Add user** — create at least one account. (A
    *Create account* tab appears on the login screen only if you enable
    sign-ups in Supabase.)
-3. **Project Settings → API**: copy the Project URL and the `anon` public key
-   (the long `eyJ…` one).
+3. Get the two values:
+   - **URL** — **Integrations → Data API**: copy the **API URL** — just the base, e.g. `https://<project>.supabase.co`, **without** `/rest/v1/` on the end. The Data API page shows it with `/rest/v1/` appended;
+     the Supabase client adds that path itself, so leaving it in breaks login.
+   - **Key** — **Project Settings → API Keys → Legacy anon, service_role API keys**: copy the **`anon` `public`** key (the long `eyJ…` one). Never the `service_role` key.
 4. Put them in **both** places:
    - `.env` → `SUPABASE_URL=` and `SUPABASE_ANON_KEY=`
    - `pdm-frontend/.env.local` → `VITE_SUPABASE_URL=` and `VITE_SUPABASE_ANON_KEY=`
@@ -961,6 +963,7 @@ Start with `curl http://localhost:8000/api/health`, then
 | Gauges show "—" | That reading is missing from the newest row | Check the PLC register / flow |
 | Login screen never appears | `VITE_SUPABASE_*` blank, or frontend not rebuilt after setting them | Set them in `.env.local`, `npm run build` |
 | Can't log in, API returns 401 | API and frontend point at different Supabase projects | Same URL + key in `.env` and `.env.local` |
+| Login or Supabase calls fail with 404s | Supabase URL still ends in `/rest/v1/` | Use the base URL only (`https://<project>.supabase.co`), then rebuild the frontend |
 | Settings won't save | Supabase not configured, or `schema.sql` not run | The amber banner on Settings says which |
 | Save bar never clears after saving | Comparing configs with `JSON.stringify` | Use `stableStringify()` |
 | Browser tab crashes after a while | Running `npm run dev` | Use `npm run build` + `npm run preview` |

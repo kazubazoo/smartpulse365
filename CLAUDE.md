@@ -115,9 +115,12 @@ not enough.
    Explorer (:8888); repeated `401 Unauthorized` in the log means the token
    field is empty or wrong.
 6. Optional Supabase: run `supabase/schema.sql` in the SQL Editor, then put the
-   Project URL and an anon key (the long `eyJ…` JWT is the most compatible) in
-   **both** `.env` (`SUPABASE_URL` / `SUPABASE_ANON_KEY`) and
+   URL and anon key in **both** `.env` (`SUPABASE_URL` / `SUPABASE_ANON_KEY`) and
    `pdm-frontend/.env.local` (`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`).
+   - URL: Integrations → Data API → **API URL**, the base only
+     (`https://<project>.supabase.co`) — strip the trailing `/rest/v1/`.
+   - Key: Project Settings → API Keys → **Legacy anon, service_role API keys** →
+     the `anon` `public` key (the long `eyJ…` JWT is the most compatible).
    Create at least one user under Authentication → Users — there is no sign-up
    screen. `docker compose up -d api` to load the API-side vars.
 7. `cd pdm-frontend && npm ci && npm run build && npm run preview`
